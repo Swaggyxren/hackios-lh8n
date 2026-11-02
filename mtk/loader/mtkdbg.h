@@ -38,18 +38,22 @@
 /* LK's framebuffer (mblock "framebuffer"), the layer LK shows the logo on. */
 #define LK_FB_BASE           0x787b0000ULL
 #define LK_FB_SIZE           0x1050000ULL
-#define LK_FB_PITCH          2944u      /* 736 pixels: LK aligns the width to 32 */
+#ifndef LK_FB_PITCH
+#define LK_FB_PITCH          4352u      /* 1080 pixels (aligned to 32/64): 1088 * 4 */
+#endif
 #ifndef PANEL_W
-#define PANEL_W              720u
+#define PANEL_W              1080u
 #endif
 #ifndef PANEL_H
-#define PANEL_H              1640u
+#define PANEL_H              2460u
 #endif
 
 #define DISP_MUTEX_EN        0x14001020ULL
 #define DISP_MUTEX_RUN       0x14001024ULL
 
-#define OVL0_BASE            0x1400b000ULL
+#ifndef OVL0_BASE
+#define OVL0_BASE            0x14005000ULL
+#endif
 #define OVL_SRC_CON          0x02c      /* a bit per layer the hardware composes */
 #define OVL_L0_CON           0x030
 #define OVL_L0_PITCH         0x044
