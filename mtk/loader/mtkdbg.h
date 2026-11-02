@@ -39,8 +39,12 @@
 #define LK_FB_BASE           0x787b0000ULL
 #define LK_FB_SIZE           0x1050000ULL
 #define LK_FB_PITCH          2944u      /* 736 pixels: LK aligns the width to 32 */
+#ifndef PANEL_W
 #define PANEL_W              720u
+#endif
+#ifndef PANEL_H
 #define PANEL_H              1640u
+#endif
 
 #define DISP_MUTEX_EN        0x14001020ULL
 #define DISP_MUTEX_RUN       0x14001024ULL

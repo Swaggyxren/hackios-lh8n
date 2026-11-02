@@ -2,5 +2,6 @@
 # controller's firmware out of your phone, the font rasterized on your Mac)
 loader/*.o
 loader/*.bin
+loader/*.img
 loader/touchfw.h
 loader/font8x16.h
