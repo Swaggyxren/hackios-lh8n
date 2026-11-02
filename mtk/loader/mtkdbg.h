@@ -18,13 +18,13 @@
 #include <stdint.h>
 #include "font8x16.h"
 
-#define RAMOOPS_CONSOLE      0x4d09f000ULL
+#define RAMOOPS_CONSOLE      0x480ef000ULL
 #define RAMOOPS_CONSOLE_SIZE 0x40000u
 #define RAMOOPS_SIG          0x43474244u
 /* the pmsg zone: Android's request for one XNU boot comes in it (boot-xnu.sh), the kernel's lines for the
  * host go out in it (kern.redwood.host_keep) */
-#define RAMOOPS_PMSG         0x4d0e0000ULL
-#define RAMOOPS_PMSG_SIZE    0x10000u
+#define RAMOOPS_PMSG         0x48130000ULL
+#define RAMOOPS_PMSG_SIZE    0x40000u
 
 #define TOPRGU_BASE          0x10007000ULL
 #define TOPRGU_MODE          (TOPRGU_BASE + 0x00)
@@ -36,8 +36,8 @@
 #define TOPRGU_SWRST_KEY     0x1209u
 
 /* LK's framebuffer (mblock "framebuffer"), the layer LK shows the logo on. */
-#define LK_FB_BASE           0x787b0000ULL
-#define LK_FB_SIZE           0x1050000ULL
+#define LK_FB_BASE           0x76950000ULL
+#define LK_FB_SIZE           0x1eb0000ULL
 #ifndef LK_FB_PITCH
 #define LK_FB_PITCH          4352u      /* 1080 pixels (aligned to 32/64): 1088 * 4 */
 #endif
@@ -58,6 +58,15 @@
 #define OVL_L0_CON           0x030
 #define OVL_L0_PITCH         0x044
 #define OVL_L0_ADDR          0xf40
+
+#ifndef RDMA0_BASE
+#define RDMA0_BASE           0x14007000ULL
+#endif
+#define RDMA_GLOBAL_CON      0x000
+#define RDMA_SIZE_CON_0      0x014
+#define RDMA_SIZE_CON_1      0x018
+#define RDMA_MEM_START_ADDR  0xf00
+#define RDMA_MEM_SRC_PITCH   0x02c
 
 static inline uint32_t rd32(uint64_t a) { return *(volatile uint32_t *)a; }
 static inline void wr32(uint64_t a, uint32_t v) { *(volatile uint32_t *)a = v; }

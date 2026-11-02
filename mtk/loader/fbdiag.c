@@ -123,17 +123,27 @@ void fbdiag_fault(uint64_t vec, uint64_t esr, uint64_t elr, uint64_t far)
 void fbdiag_main(uint64_t dtb)
 {
 	wdt_disable();
+	plog_reset();
 	chain_dtb = dtb;
 
-	/* Where does OVL0 layer 0 read from? Use it only if it is inside DRAM. */
+	/* Where does OVL0 layer 0 or RDMA0 read from? Use it only if it is inside DRAM. */
 	uint32_t l0_addr = rd32(OVL0_BASE + OVL_L0_ADDR);
 	uint32_t l0_pitch = rd32(OVL0_BASE + OVL_L0_PITCH) & 0xffff;
 	uint32_t l0_con = rd32(OVL0_BASE + OVL_L0_CON);
+	uint32_t rdma_addr = rd32(RDMA0_BASE + RDMA_MEM_START_ADDR);
+	uint32_t rdma_con = rd32(RDMA0_BASE + RDMA_GLOBAL_CON);
+	uint32_t rdma_pitch = rd32(RDMA0_BASE + RDMA_MEM_SRC_PITCH);
+
 	uint64_t fb = 0;
 	uint32_t pitch = LK_FB_PITCH;
 	if (l0_addr >= 0x40000000ULL && l0_addr < 0xfe000000ULL && l0_pitch >= PANEL_W * 4 && l0_pitch <= 8192) {
 		fb = l0_addr;
 		pitch = l0_pitch;
+	} else if (rdma_addr >= 0x40000000ULL && rdma_addr < 0xfe000000ULL) {
+		fb = rdma_addr;
+		if (rdma_pitch >= PANEL_W * 4 && rdma_pitch <= 8192) {
+			pitch = rdma_pitch;
+		}
 	} else if (LK_FB_BASE >= 0x40000000ULL) {
 		fb = LK_FB_BASE;
 	}
@@ -152,31 +162,52 @@ void fbdiag_main(uint64_t dtb)
 		fbc.y = 360;
 		fbc.x = 0;
 		fbc.fg = 0xff40ff40u;
-		dbg_puts("== HakiOS fbdiag (Tecno LH8n MT6833) ==\n");
+	}
+
+	dbg_puts("== HakiOS fbdiag (Tecno LH8n MT6833) ==\n");
+	if (fb != 0) {
 		fbc.scale = 1;
 		fbc.y = 560;
 		fbc.x = 0;
 		fbc.fg = 0xffffffffu;
-		dbg_puts("x0(dtb)=");
-		dbg_hex(dtb, 10);
-		dbg_putc('\n');
-		report_sysregs();
-		dbg_puts("OVL0 L0_ADDR=");
-		dbg_hex(l0_addr, 8);
-		dbg_puts(" L0_PITCH=");
-		dbg_hex(l0_pitch, 4);
-		dbg_puts(" L0_CON=");
-		dbg_hex(l0_con, 8);
-		dbg_puts("\n");
 	}
+	dbg_puts("x0(dtb)=");
+	dbg_hex(dtb, 10);
+	dbg_putc('\n');
+	report_sysregs();
+	dbg_puts("FB=");
+	dbg_hex(fb, 10);
+	dbg_puts(" pitch=");
+	dbg_dec(pitch);
+	dbg_puts(" (LK_FB_BASE=");
+	dbg_hex(LK_FB_BASE, 8);
+	dbg_puts(")\n");
+	dbg_puts("OVL0 L0_ADDR=");
+	dbg_hex(l0_addr, 8);
+	dbg_puts(" PITCH=");
+	dbg_hex(l0_pitch, 4);
+	dbg_puts(" CON=");
+	dbg_hex(l0_con, 8);
+	dbg_puts("\n");
+	dbg_puts("RDMA0 ADDR=");
+	dbg_hex(rdma_addr, 8);
+	dbg_puts(" CON=");
+	dbg_hex(rdma_con, 8);
+	dbg_puts(" PITCH=");
+	dbg_hex(rdma_pitch, 8);
+	dbg_puts("\n");
+
+	/* Register dumps to plog only (keep quiet on screen) */
+	dbg_dump("OVL0", OVL0_BASE, 0x000, 0x060, 1);
+	dbg_dump("OVL0", OVL0_BASE, 0xf00, 0xf60, 1);
+	dbg_dump("RDMA0", RDMA0_BASE, 0x000, 0x040, 1);
+	dbg_dump("RDMA0", RDMA0_BASE, 0xf00, 0xf20, 1);
 
 	/* Wait FBDIAG_SECONDS (5s) then safely chain to Android */
 	for (int s = FBDIAG_SECONDS; s > 0; s--) {
-		if (fb != 0) {
-			dbg_puts("Starting Android in ");
-			dbg_dec(s);
-			dbg_puts(" s...\n");
-		}
+		dbg_puts("Starting Android in ");
+		dbg_dec(s);
+		dbg_puts(" s...\n");
 		dbg_delay_ms(1000);
 	}
 	chain_android();
