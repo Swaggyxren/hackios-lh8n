@@ -99,7 +99,7 @@ static const uint8_t core_order[8] = { 0, 7, 6, 1, 2, 3, 4, 5 };
 #define TIMER_PROBE         0
 #endif
 #ifndef MENU_DEFAULT_XNU
-#define MENU_DEFAULT_XNU    0
+#define MENU_DEFAULT_XNU    1
 #endif
 /*
  * 1: the kernel's text console on the screen (-v). It is a slow way to run -- scrolling reads
@@ -141,7 +141,7 @@ static const uint8_t core_order[8] = { 0, 7, 6, 1, 2, 3, 4, 5 };
 #define CHAIN_STUB_PA       0x4a000000ULL
 
 /* Run state, kept in DRAM across the watchdog reset (three copies: a bit may flip). */
-#define MARKER_PA           0x80000000ULL
+#define MARKER_PA           0x4812f000ULL
 #define MARK_RUNNING        0x4e52584eu /* "NXRN" */
 #define MARK_DONE           0x4e44584eu /* "NXDN" */
 
@@ -332,10 +332,7 @@ int strcmp(const char *s1, const char *s2)
 
 static void uart_putc(char c)
 {
-	uint32_t timeout = 20000;
-	while (!(rd32(MT6768_UART_BASE + 0x14) & 0x20) && --timeout) {
-	}
-	wr32(MT6768_UART_BASE, (uint8_t)c);
+	(void)c;
 }
 
 static void out_putc(char c)
@@ -410,7 +407,7 @@ static void display_find(void)
 
 	fb_base = LK_FB_BASE;
 	fb_pitch = LK_FB_PITCH;
-	if (addr >= LK_FB_BASE && addr < LK_FB_BASE + LK_FB_SIZE && pitch >= PANEL_W * 4 && pitch <= 4096) {
+	if (addr >= LK_FB_BASE && addr < LK_FB_BASE + LK_FB_SIZE && pitch >= PANEL_W * 4 && pitch <= 8192) {
 		fb_base = addr;
 		fb_pitch = pitch;
 	}
@@ -441,48 +438,6 @@ static void display_alpha_off(void)
 	out(" -> ");
 	out_hex(rd32(OVL0_BASE + OVL_SRC_CON));
 	out("\n");
-}
-
-/* ---- payload and the kernel's symbols ---- */
-
-static const struct payload_header *payload_find(void)
-{
-	const volatile uint64_t *hdr = (const volatile uint64_t *)_start;
-	uint64_t off = hdr[6]; /* res3 */
-	const struct payload_header *ph = (const struct payload_header *)((uint64_t)_start + off);
-
-	if (off == 0 || (off & 15) || ph->magic != PAYLOAD_MAGIC) {
-		return NULL;
-	}
-	return ph;
-}
-
-static int parse_payload(struct payload_info *pi)
-{
-	const struct payload_header *ph = payload_find();
-
-	memset(pi, 0, sizeof(*pi));
-	if (!ph) {
-		return 0;
-	}
-	const uint8_t *p = (const uint8_t *)(ph + 1), *pend = p + ph->size;
-	while (p + sizeof(struct payload_entry) <= pend) {
-		const struct payload_entry *e = (const struct payload_entry *)p;
-		if (e->name[0] == 0) {
-			break;
-		}
-		if (strcmp(e->name, "kernel") == 0) {
-			pi->kernel = p + sizeof(*e);
-			pi->kernel_size = e->size;
-		} else if (strcmp(e->name, "ramdisk") == 0) {
-			pi->ramdisk = p + sizeof(*e);
-			pi->ramdisk_size = e->size;
-		} else if (strcmp(e->name, "kernel.ver") == 0 && e->size > 1) {
-			pi->kernel_version = (const char *)(p + sizeof(*e));
-		}
-		p += sizeof(*e) + ((e->size + 15) & ~15u);
-	}
-	return pi->kernel != NULL && ((const struct mach_header_64 *)pi->kernel)->magic == MH_MAGIC_64;
 }
 
 static void find_syms(const uint8_t *kernel, struct xnu_syms *s)
@@ -543,33 +498,57 @@ static uint64_t kva_to_pa(uint64_t va)
  * so it lives in its own partition (tools/gpt-carve.py made "xnusys" out of the end of userdata)
  * and is read into DRAM here. The payload's small root.packfs stays the second disk (md1).
  */
-static uint8_t gpt_entries[128 * 128] __attribute__((aligned(16)));
+#define GPT_MAX_ENTRIES 256
+static uint8_t gpt_entries[GPT_MAX_ENTRIES * 128] __attribute__((aligned(16)));
 static uint8_t sector_buf[512] __attribute__((aligned(16)));
 
 /* The partition's first block and length, by the name in the GPT. */
 static int gpt_find(const char *name, uint64_t *lba, uint64_t *blocks)
 {
 	if (!msdc_read(1, 1, sector_buf)) {
+		out("gpt: msdc_read(1) failed: ");
+		out(msdc_last.what);
+		out(", status ");
+		out_hex(msdc_last.status);
+		out("\n");
 		return 0;
 	}
 	if (memcmp_n(sector_buf, "EFI PART", 8)) {
+		out("gpt: not EFI PART, sig: ");
+		for (int i = 0; i < 8; i++) {
+			out_hex(sector_buf[i]);
+			out_putc(' ');
+		}
+		out("\n");
 		return 0;
 	}
 	uint64_t ent_lba = *(volatile uint64_t *)(sector_buf + 72);
 	uint32_t count = *(volatile uint32_t *)(sector_buf + 80);
 	uint32_t size = *(volatile uint32_t *)(sector_buf + 84);
 
-	if (count > 128 || size != 128) {
+	out("gpt: ent_lba ");
+	out_hex(ent_lba);
+	out(" count ");
+	out_dec(count);
+	out(" size ");
+	out_dec(size);
+	out("\n");
+
+	if (count > GPT_MAX_ENTRIES || size != 128) {
+		out("gpt: unsupported count or size\n");
 		return 0;
 	}
 	if (!msdc_read(ent_lba, count * size / 512, gpt_entries)) {
+		out("gpt: read entries failed: ");
+		out(msdc_last.what);
+		out("\n");
 		return 0;
 	}
 	for (uint32_t i = 0; i < count; i++) {
 		const uint8_t *e = gpt_entries + i * size;
 		int same = 1;
 
-		for (int k = 0; same && name[k - (k ? 0 : 0)] != 0; k++) {
+		for (int k = 0; same && name[k] != 0; k++) {
 			same = e[56 + 2 * k] == (uint8_t)name[k] && e[57 + 2 * k] == 0;
 		}
 		if (same && e[56 + 2 * (int)strlen(name)] == 0) {
@@ -580,9 +559,19 @@ static int gpt_find(const char *name, uint64_t *lba, uint64_t *blocks)
 			}
 			*lba = first;
 			*blocks = last - first + 1;
+			out("gpt: found ");
+			out(name);
+			out(" at LBA ");
+			out_hex(*lba);
+			out(" (");
+			out_dec(*blocks * 512 / 1024 / 1024);
+			out(" MB)\n");
 			return 1;
 		}
 	}
+	out("gpt: partition ");
+	out(name);
+	out(" not in table\n");
 	return 0;
 }
 
@@ -684,6 +673,169 @@ static uint64_t load_system_image(void)
 	out_dec(size / 1024 / (ms ? ms : 1) * 1000 / 1024);
 	out(" MB/s)\n");
 	return size;
+}
+
+/* ---- payload and the kernel's symbols ---- */
+
+static void find_lk_initrd(uint64_t dtb, uint64_t *rd_start, uint64_t *rd_end)
+{
+	*rd_start = 0x51100000ULL;
+	*rd_end = 0x55000000ULL;
+	if (!dtb) return;
+	const uint8_t *fdt = (const uint8_t *)(uintptr_t)dtb;
+	if (dt_be32(fdt) != FDT_MAGIC) return;
+
+	const uint8_t *structs = fdt + dt_be32(fdt + 8);
+	const char *strings = (const char *)(fdt + dt_be32(fdt + 12));
+	const uint8_t *end = structs + dt_be32(fdt + 36);
+
+	int in_chosen = 0;
+	for (const uint8_t *p = structs; p < end;) {
+		uint32_t token = dt_be32(p);
+		p += 4;
+		if (token == FDT_BEGIN_NODE) {
+			const char *name = (const char *)p;
+			p += (strlen(name) + 1 + 3) & ~3u;
+			if (dt_streq(name, "chosen")) in_chosen = 1;
+		} else if (token == FDT_END_NODE) {
+			if (in_chosen) in_chosen = 0;
+		} else if (token == FDT_PROP) {
+			uint32_t len = dt_be32(p), nameoff = dt_be32(p + 4);
+			const char *prop = strings + nameoff;
+			const uint8_t *val = p + 8;
+			p += 8 + ((len + 3) & ~3u);
+			if (in_chosen) {
+				if (dt_streq(prop, "linux,initrd-start")) {
+					*rd_start = len == 4 ? dt_be32(val) : ((uint64_t)dt_be32(val) << 32 | dt_be32(val + 4));
+				} else if (dt_streq(prop, "linux,initrd-end")) {
+					*rd_end = len == 4 ? dt_be32(val) : ((uint64_t)dt_be32(val) << 32 | dt_be32(val + 4));
+				}
+			}
+		} else if (token == FDT_END) {
+			break;
+		}
+	}
+}
+
+static const struct payload_header *payload_find(void)
+{
+	const volatile uint64_t *hdr = (const volatile uint64_t *)_start;
+	uint64_t off = hdr[6]; /* res4 */
+
+	if (off != 0 && !(off & 15)) {
+		const struct payload_header *ph = (const struct payload_header *)((uint64_t)_start + off);
+		if (ph->magic == PAYLOAD_MAGIC) {
+			return ph;
+		}
+	}
+
+	/* 1. Check in DRAM (0x50000000) if already loaded */
+	const struct payload_header *ph_dram = (const struct payload_header *)0x50000000ULL;
+	if (ph_dram->magic == PAYLOAD_MAGIC) {
+		return ph_dram;
+	}
+
+	/* 2. Fast check: vendor_boot ramdisk 4K-aligned location */
+	const struct payload_header *ph_vb = (const struct payload_header *)0x52f0e000ULL;
+	if (ph_vb->magic == PAYLOAD_MAGIC) {
+		out("payload found in vendor ramdisk at 0x52f0e000: ");
+		out_dec(ph_vb->size);
+		out(" bytes\n");
+		return ph_vb;
+	}
+
+	/* 3. Find initrd bounds from LK's DTB and scan for XNUP payload */
+	uint64_t rd_start = 0, rd_end = 0;
+	find_lk_initrd(lk_dtb, &rd_start, &rd_end);
+	out("LK initrd: ");
+	out_hex(rd_start);
+	out(" .. ");
+	out_hex(rd_end);
+	out("\n");
+
+	const uint8_t *found_p = NULL;
+	if (rd_start >= 0x40000000ULL && rd_end > rd_start && (rd_end - rd_start) < 128 * 1024 * 1024ULL) {
+		out("scanning initrd for XNU payload...\n");
+		for (const uint8_t *p = (const uint8_t *)(uintptr_t)rd_start;
+		     p + sizeof(struct payload_header) <= (const uint8_t *)(uintptr_t)rd_end;
+		     p++) {
+			if (p[0] == 'X' && p[1] == 'N' && p[2] == 'U' && p[3] == 'P') {
+				found_p = p;
+				break;
+			}
+		}
+	}
+	if (found_p) {
+		out("payload found in DRAM at ");
+		out_hex((uint64_t)(uintptr_t)found_p);
+		uint32_t psize = (uint32_t)found_p[4] | ((uint32_t)found_p[5] << 8) |
+		                 ((uint32_t)found_p[6] << 16) | ((uint32_t)found_p[7] << 24);
+		out(" (");
+		out_dec(psize);
+		out(" bytes)\n");
+		return (const struct payload_header *)found_p;
+	}
+	out("payload not in LK initrd\n");
+
+	/* 2. Load from boot_b partition on eMMC */
+	uint64_t lba = 0, blocks = 0;
+	if (gpt_find("boot_b", &lba, &blocks)) {
+		out("loading XNU payload from boot_b (LBA ");
+		out_hex(lba);
+		out(")...\n");
+		uint32_t to_read = 32864; /* ~16.8 MB */
+		if (to_read > blocks) {
+			to_read = (uint32_t)blocks;
+		}
+		if (msdc_read(lba, to_read, (void *)0x50000000ULL)) {
+			if (ph_dram->magic == PAYLOAD_MAGIC) {
+				out("payload loaded from boot_b: ");
+				out_dec(ph_dram->size);
+				out(" bytes\n");
+				return ph_dram;
+			}
+			out("boot_b magic is ");
+			out_hex(ph_dram->magic);
+			out(", expected ");
+			out_hex(PAYLOAD_MAGIC);
+			out("\n");
+		} else {
+			out("msdc_read boot_b failed: ");
+			out(msdc_last.what);
+			out("\n");
+		}
+	} else {
+		out("boot_b partition not found in GPT\n");
+	}
+	return NULL;
+}
+
+static int parse_payload(struct payload_info *pi)
+{
+	const struct payload_header *ph = payload_find();
+
+	memset(pi, 0, sizeof(*pi));
+	if (!ph) {
+		return 0;
+	}
+	const uint8_t *p = (const uint8_t *)(ph + 1), *pend = p + ph->size;
+	while (p + sizeof(struct payload_entry) <= pend) {
+		const struct payload_entry *e = (const struct payload_entry *)p;
+		if (e->name[0] == 0) {
+			break;
+		}
+		if (strcmp(e->name, "kernel") == 0) {
+			pi->kernel = p + sizeof(*e);
+			pi->kernel_size = e->size;
+		} else if (strcmp(e->name, "ramdisk") == 0) {
+			pi->ramdisk = p + sizeof(*e);
+			pi->ramdisk_size = e->size;
+		} else if (strcmp(e->name, "kernel.ver") == 0 && e->size > 1) {
+			pi->kernel_version = (const char *)(p + sizeof(*e));
+		}
+		p += sizeof(*e) + ((e->size + 15) & ~15u);
+	}
+	return pi->kernel != NULL && ((const struct mach_header_64 *)pi->kernel)->magic == MH_MAGIC_64;
 }
 
 /* ---- device tree for XNU ---- */
@@ -973,7 +1125,7 @@ static void __attribute__((noreturn)) chain_android(void)
 {
 	const volatile uint64_t *hdr = (const volatile uint64_t *)_start;
 	const volatile uint32_t *img = (const volatile uint32_t *)((uint64_t)_start + CHAIN_OFFSET);
-	uint64_t image_size = (hdr[5] + 7) & ~7ULL; /* res2 */
+	uint64_t image_size = (hdr[5] + 7) & ~7ULL; /* res3 */
 
 	marker_set(0);
 	if (image_size == 0 || img[14] != 0x644d5241u) { /* "ARM\x64" */
@@ -2072,6 +2224,9 @@ static uint8_t touch_bring_up_once(void)
  */
 static uint8_t touch_bring_up(void)
 {
+	if (TOUCH_FW_SIZE == 0) {
+		return 0;
+	}
 	for (int attempt = 1; attempt <= 6; attempt++) {
 		uint8_t mode = touch_bring_up_once();
 
@@ -2998,14 +3153,10 @@ static const char boot_xnu_flag[] = "DARWIN-REDWOOD:BOOT-XNU";
  */
 static int pmsg_take(const char *flag, uint32_t n)
 {
-	volatile struct ramoops_hdr *h = (volatile struct ramoops_hdr *)RAMOOPS_PMSG;
-	volatile char *d = (volatile char *)(RAMOOPS_PMSG + sizeof(struct ramoops_hdr));
-	uint32_t cap = RAMOOPS_PMSG_SIZE - sizeof(struct ramoops_hdr);
+	volatile char *d = (volatile char *)RAMOOPS_PMSG;
+	uint32_t cap = RAMOOPS_PMSG_SIZE;
 	int found = 0;
 
-	if (h->sig != RAMOOPS_SIG || h->size > cap) {
-		return 0;
-	}
 	for (uint32_t at = 0; at + n <= cap; at++) {
 		uint32_t k = 0;
 		while (k < n && d[at + k] == flag[k]) {
@@ -3016,6 +3167,7 @@ static int pmsg_take(const char *flag, uint32_t n)
 				d[at + k] = '-';
 			}
 			found = 1;
+			break;
 		}
 	}
 	return found;
@@ -3395,16 +3547,17 @@ void mtkloader_main(uint64_t dtb)
 	display_find();
 	fbcon_init(fb_base, fb_pitch, 0, 1);
 
-	if (mark == MARK_DONE) {
-		/* XNU's log was saved when it came back; leave ramoops as it is. */
-		chain_android();
-	}
-	if (mark == MARK_RUNNING) {
-		rescue_log();
-		dbg_delay_ms(5000);
+	/* If XNU completed its run or watchdog triggered, return to Android */
+	if (mark == MARK_DONE || mark == MARK_RUNNING) {
+		marker_set(0);
+		if (mark == MARK_RUNNING) {
+			rescue_log();
+			dbg_delay_ms(2000);
+		}
 		chain_android();
 	}
 
+	marker_set(0);
 	plog_reset();
 #if TOUCH_PROBE
 	fb_rect(0, 0, PANEL_W, PANEL_H, 0xff000000u);
@@ -3443,7 +3596,7 @@ void mtkloader_main(uint64_t dtb)
 	fbc.x = 0;
 	fbc.y = fbc.top = 0;
 	fbc.fg = 0xff40ff40u;
-	out("== mtkloader: Darwin/XNU on X6826B (MT6768) ==\n");
+	out("== mtkloader: Darwin/XNU on Tecno LH8n (MT6833) ==\n");
 	fbc.fg = 0xffffffffu;
 	out("LK dtb ");
 	out_hex(dtb);

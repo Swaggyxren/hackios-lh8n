@@ -14,7 +14,6 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))       # the top of the tree: mtk/loader/ is two below it
 
-android = sys.argv[1] if len(sys.argv) > 1 else os.environ.get('ANDROID_BOOT', os.path.join(ROOT, 'backup', 'boot_a_magisk.img'))
-subprocess.check_call([sys.executable, os.path.join(ROOT, 'mtk', 'tools', 'chainboot.py'), android,
-                       os.path.join(HERE, 'mtkloader.bin'), os.path.join(ROOT, 'xnu-flashed-slot_a.img'),
-                       os.path.join(ROOT, 'build-payload.bin')])
+android = sys.argv[1] if len(sys.argv) > 1 else os.environ.get('ANDROID_BOOT', '/home/ydnar/Downloads/boot.img')
+subprocess.check_call([sys.executable, os.path.join(ROOT, 'mtk', 'tools', 'chainboot_v4.py'), android,
+                       os.path.join(HERE, 'mtkloader.bin'), os.path.join(ROOT, 'xnu-flashed-slot_a.img')])
