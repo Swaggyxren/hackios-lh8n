@@ -77,7 +77,7 @@ static const uint8_t core_order[8] = { 0, 7, 6, 1, 2, 3, 4, 5 };
 #ifndef XNU_CHECKPOINT
 #define XNU_CHECKPOINT      0
 #endif
-/* loader_return_after: XNU comes back by itself after that long, with its log (loader_return.c) */
+/* loader_return_after: XNU comes back by itself after that long, with its log (loader_return.c); 0 = stay running */
 #ifndef XNU_RETURN_AFTER
 #define XNU_RETURN_AFTER    "0"
 #endif
@@ -107,7 +107,7 @@ static const uint8_t core_order[8] = { 0, 7, 6, 1, 2, 3, 4, 5 };
  * it and the log comes back through the loader instead (v_display = 1 says "graphics mode").
  */
 #ifndef XNU_VERBOSE
-#define XNU_VERBOSE         0
+#define XNU_VERBOSE         1
 #endif
 /* More for the kernel's command line: cores, the clock (epoch=), whatever a run wants to try. */
 /* The serial number iOS is told (the device tree's serial-number): a placeholder, not any real device's. */
@@ -115,18 +115,18 @@ static const uint8_t core_order[8] = { 0, 7, 6, 1, 2, 3, 4, 5 };
 #define XNU_SERIAL          "HAKIOS0000000000"
 #endif
 #ifndef XNU_EXTRA_ARGS
-#define XNU_EXTRA_ARGS      "cpus=1"
+#define XNU_EXTRA_ARGS      "cpus=1 systrace=1 applog=1"
 #endif
 /*
  * 1: the system image stays on the eMMC and the kernel reads it as it needs it (emmc_root=1,
  * bsd/dev/redwood_emmc.c), the default; 0: it is read into DRAM here as md0 -- 2.4 GB of the kernel's 4 GB,
  * wired from the start, and three and a half minutes of every boot (run 320).
  */
-#ifndef XNU_ROOT_EMMC
-#define XNU_ROOT_EMMC       1
+#ifndef XNU_ROOT_STORAGE
+#define XNU_ROOT_STORAGE    1
 #endif
-#if XNU_ROOT_EMMC
-#define XNU_ROOT_ARG        "rd=md0 emmc_root=1"     /* (rd=md0 for libignition's "ramdisk" boot) */
+#if XNU_ROOT_STORAGE
+#define XNU_ROOT_ARG        "rd=md0 ufs_root=1 ufs_shared_pa=0x80200000 ufs_native=1 root_apfs=ufs_xnusys"
 #else
 #define XNU_ROOT_ARG        "rd=md0"
 #endif
@@ -386,6 +386,7 @@ static void marker_set(uint32_t v)
 	for (int i = 0; i < 3; i++) {
 		wr32(MARKER_PA + 64 * i, v);
 	}
+	dcache_clean_range(MARKER_PA, 192);
 }
 
 static uint32_t marker_get(void)
@@ -578,7 +579,20 @@ static int gpt_find(const char *name, uint64_t *lba, uint64_t *blocks)
 /* Reads the image into SYSTEM_PA; returns its length, 0 if there is none to read. */
 static uint64_t load_system_image(void)
 {
+#if XNU_ROOT_STORAGE
+	out("the system image is read by the kernel's own UFS driver, not by the loader\n");
+	return 0;
+#else
 	uint64_t lba, blocks, size = 0, done = 0, t0 = dbg_ticks(), f = dbg_freq();
+
+	if (!msdc_init()) {
+		out("msdc_init: ");
+		out(msdc_last.what);
+		out(" (status ");
+		out_hex(msdc_last.status);
+		out(")\n");
+		return 0;
+	}
 
 	if (!gpt_find(SYSTEM_PART, &lba, &blocks)) {
 		out("no " SYSTEM_PART " partition on the flash (or the GPT could not be read)\n");
@@ -673,6 +687,197 @@ static uint64_t load_system_image(void)
 	out_dec(size / 1024 / (ms ? ms : 1) * 1000 / 1024);
 	out(" MB/s)\n");
 	return size;
+#endif
+}
+
+#define UFSHCI_BASE         0x11270000ULL
+#define UFSHCI_SIZE         0x2300ULL
+#define UFS_SHARED_BLOCK_PA 0x80200000ULL
+#define UFS_HC_AREA_PA      0x80210000ULL
+#define UFS_HC_AREA_SIZE    0x11000u
+#define UFS_DATA_BUFFER_PA  0x80230000ULL
+#define UFS_DATA_BUFFER_SIZE (64u * 1024u)
+
+static void ufs_probe(void)
+{
+	out("== UFS Host Controller Handover (0x11270000) ==\n");
+	uint32_t cap = rd32(UFSHCI_BASE + 0x00);
+	uint32_t ver = rd32(UFSHCI_BASE + 0x08);
+	uint32_t did = rd32(UFSHCI_BASE + 0x10);
+	uint32_t pmid = rd32(UFSHCI_BASE + 0x14);
+	uint32_t is_reg = rd32(UFSHCI_BASE + 0x20);
+	uint32_t ie_reg = rd32(UFSHCI_BASE + 0x24);
+	uint32_t hcs = rd32(UFSHCI_BASE + 0x30);
+	uint32_t hce = rd32(UFSHCI_BASE + 0x34);
+	uint32_t utrlba = rd32(UFSHCI_BASE + 0x50);
+	uint32_t utrlbau = rd32(UFSHCI_BASE + 0x54);
+	uint32_t utrldbr = rd32(UFSHCI_BASE + 0x58);
+	uint32_t utrlrsr = rd32(UFSHCI_BASE + 0x60);
+	uint32_t utmrlba = rd32(UFSHCI_BASE + 0x70);
+	uint32_t utmrlbau = rd32(UFSHCI_BASE + 0x74);
+	uint32_t utmrlrsr = rd32(UFSHCI_BASE + 0x80);
+
+	out("  CAP:     "); out_hex(cap);
+	out("  VER:     "); out_hex(ver);
+	out(" (v"); out_dec((ver >> 8) & 0xff); out("."); out_dec((ver >> 4) & 0xf); out(")\n");
+	out("  DID:     "); out_hex(did);
+	out("  PMID:    "); out_hex(pmid);
+	out("\n");
+	out("  HCE:     "); out_hex(hce);
+	out("  HCS:     "); out_hex(hcs);
+	out(" (DP="); out_dec(hcs & 1);
+	out(" UTRLRDY="); out_dec((hcs >> 1) & 1);
+	out(" UTMRLRDY="); out_dec((hcs >> 2) & 1);
+	out(" UCMD_RDY="); out_dec((hcs >> 3) & 1);
+	out(" LinkState="); out_dec((hcs >> 8) & 0xf);
+	out(")\n");
+	out("  IS:      "); out_hex(is_reg);
+	out("  IE:      "); out_hex(ie_reg);
+	out("\n");
+	out("  UTRLBA:  "); out_hex(utrlbau); out(":"); out_hex(utrlba);
+	out("  RSR:     "); out_hex(utrlrsr);
+	out("  DBR:     "); out_hex(utrldbr);
+	out("\n");
+	out("  UTMRLBA: "); out_hex(utmrlbau); out(":"); out_hex(utmrlba);
+	out("  RSR:     "); out_hex(utmrlrsr);
+	out("\n");
+
+	if (utrlba != 0) {
+		volatile uint32_t *slot0 = (volatile uint32_t *)(uintptr_t)utrlba;
+		out("  Slot 0 UTRD:\n    ");
+		out_hex(slot0[0]); out(" ");
+		out_hex(slot0[1]); out(" ");
+		out_hex(slot0[2]); out(" ");
+		out_hex(slot0[3]); out("\n");
+		out("    UCD: "); out_hex(slot0[5]); out(":"); out_hex(slot0[4]);
+		out(" RESP: "); out_hex(slot0[6]);
+		out(" PRDT: "); out_hex(slot0[7]);
+		out("\n");
+	}
+}
+
+#define BLOCK_MAGIC        0x4b434f4c42574452ULL       /* "RDWBLOCK" */
+#define BLOCK_VERSION      3
+#define BLOCK_MAX_PARTS    160
+#define BLOCK_PART_UNIT    1u
+
+struct loader_block_part {
+	char name[36];
+	uint32_t block_size;
+	uint64_t blocks;
+	uint64_t start_lba;
+	uint16_t unit;
+	uint8_t lun;
+	uint8_t flags;
+	uint32_t reserved;
+};
+
+struct loader_block {
+	uint64_t magic;
+	uint32_t version, size;
+	uint32_t parts, buffer_size;
+	uint64_t buffer_pa;
+	uint32_t write_part_plus_one;
+	uint32_t write_reserved;
+	uint64_t write_first;
+	struct {
+		volatile uint32_t request;
+		uint32_t part;
+		uint64_t lba, count;
+		uint32_t op;
+		uint32_t reserved;
+	} ask __attribute__((aligned(128)));
+	struct {
+		volatile uint32_t answered;
+		uint32_t reserved;
+		int64_t status;
+		uint64_t served, failed, bytes, ticks;
+	} answer __attribute__((aligned(128)));
+	struct loader_block_part part[BLOCK_MAX_PARTS] __attribute__((aligned(128)));
+	struct {
+		uint64_t hc_pa;
+		uint64_t area_pa;
+		uint32_t area_size, ucd_offset, ucd_size, slots;
+		uint32_t uefi_utrlba, uefi_utrlbau;
+	} native __attribute__((aligned(128)));
+	struct {
+		volatile uint32_t take_back;
+	} loader_native __attribute__((aligned(128)));
+	struct {
+		volatile uint32_t list_in;
+		uint32_t switched_in, switched_out;
+		volatile uint32_t cnr_at_switch;
+	} kernel_native __attribute__((aligned(128)));
+};
+
+_Static_assert(__builtin_offsetof(struct loader_block, ask) == 128, "ask offset");
+_Static_assert(__builtin_offsetof(struct loader_block, answer) == 256, "answer offset");
+_Static_assert(__builtin_offsetof(struct loader_block, part) == 384, "part offset");
+_Static_assert(__builtin_offsetof(struct loader_block, native) == 10624, "native offset");
+
+static void ufs_setup_shared(void)
+{
+	volatile struct loader_block *lb = (volatile struct loader_block *)(uintptr_t)UFS_SHARED_BLOCK_PA;
+	memset((void *)lb, 0, sizeof(*lb));
+	memset((void *)(uintptr_t)UFS_HC_AREA_PA, 0, UFS_HC_AREA_SIZE);
+	memset((void *)(uintptr_t)UFS_DATA_BUFFER_PA, 0, UFS_DATA_BUFFER_SIZE);
+
+	lb->magic = BLOCK_MAGIC;
+	lb->version = BLOCK_VERSION;
+	lb->size = sizeof(struct loader_block);
+	lb->buffer_size = UFS_DATA_BUFFER_SIZE;
+	lb->buffer_pa = UFS_DATA_BUFFER_PA;
+
+	uint32_t utrlba = rd32(UFSHCI_BASE + 0x50);
+	uint32_t utrlbau = rd32(UFSHCI_BASE + 0x54);
+
+	lb->native.hc_pa = UFSHCI_BASE;
+	lb->native.area_pa = UFS_HC_AREA_PA;
+	lb->native.area_size = UFS_HC_AREA_SIZE;
+	lb->native.ucd_offset = 0x1000u;
+	lb->native.ucd_size = 0x800u;
+	lb->native.slots = 32u;
+	lb->native.uefi_utrlba = utrlba;
+	lb->native.uefi_utrlbau = utrlbau;
+
+	/* Part 0: xnusys (iOS root APFS container) */
+	memcpy((void *)lb->part[0].name, "xnusys", 7);
+	lb->part[0].block_size = 4096;
+	lb->part[0].start_lba = 61427456ULL;
+	lb->part[0].blocks = 1048827ULL;
+	lb->part[0].unit = 2;
+	lb->part[0].lun = 2;
+	lb->part[0].flags = 0;
+
+	/* Part 1: userdata (carved) */
+	memcpy((void *)lb->part[1].name, "userdata", 9);
+	lb->part[1].block_size = 4096;
+	lb->part[1].start_lba = 2799616ULL;
+	lb->part[1].blocks = 58627840ULL;
+	lb->part[1].unit = 2;
+	lb->part[1].lun = 2;
+	lb->part[1].flags = 0;
+
+	/* Part 2: unit2 (whole LUN 2) */
+	memcpy((void *)lb->part[2].name, "unit2", 6);
+	lb->part[2].block_size = 4096;
+	lb->part[2].start_lba = 0ULL;
+	lb->part[2].blocks = 62480384ULL;
+	lb->part[2].unit = 2;
+	lb->part[2].lun = 2;
+	lb->part[2].flags = BLOCK_PART_UNIT;
+
+	lb->parts = 3;
+
+	dcache_clean_range(UFS_SHARED_BLOCK_PA, sizeof(struct loader_block));
+	dcache_clean_range(UFS_HC_AREA_PA, UFS_HC_AREA_SIZE);
+	dcache_clean_range(UFS_DATA_BUFFER_PA, UFS_DATA_BUFFER_SIZE);
+
+	out("ufs: shared block at ");
+	out_hex(UFS_SHARED_BLOCK_PA);
+	out(", 3 parts, native area ");
+	out_hex(UFS_HC_AREA_PA);
+	out("\n");
 }
 
 /* ---- payload and the kernel's symbols ---- */
@@ -725,6 +930,11 @@ static const struct payload_header *payload_find(void)
 	if (off != 0 && !(off & 15)) {
 		const struct payload_header *ph = (const struct payload_header *)((uint64_t)_start + off);
 		if (ph->magic == PAYLOAD_MAGIC) {
+			out("payload found in boot image at _start + ");
+			out_hex(off);
+			out(": ");
+			out_dec(ph->size);
+			out(" bytes\n");
 			return ph;
 		}
 	}
@@ -777,13 +987,13 @@ static const struct payload_header *payload_find(void)
 	}
 	out("payload not in LK initrd\n");
 
-	/* 2. Load from boot_b partition on eMMC */
+	/* 2. Load from boot_b partition on MicroSD/eMMC */
 	uint64_t lba = 0, blocks = 0;
-	if (gpt_find("boot_b", &lba, &blocks)) {
+	if (msdc_init() && gpt_find("boot_b", &lba, &blocks)) {
 		out("loading XNU payload from boot_b (LBA ");
 		out_hex(lba);
 		out(")...\n");
-		uint32_t to_read = 32864; /* ~16.8 MB */
+		uint32_t to_read = 65536; /* 32 MB (payload is ~21 MB) */
 		if (to_read > blocks) {
 			to_read = (uint32_t)blocks;
 		}
@@ -1032,8 +1242,8 @@ static uint32_t build_device_tree(uint64_t dt_pa, uint64_t rd_pa, uint64_t rd_si
 		}
 	} else if (rd_size != 0) {
 		uint64_t rd_reg[2] = { rd_pa, rd_size };
-		/* (with the system image on the eMMC the payload stays md1, where stage0 mounts it) */
-		dt_prop(&w, XNU_ROOT_EMMC ? "RAMDisk1" : "RAMDisk", rd_reg, sizeof(rd_reg));
+		/* with the system image on UFS, the payload is md0 */
+		dt_prop(&w, "RAMDisk", rd_reg, sizeof(rd_reg));
 	}
 	dt_end(&w);
 	dt_end(&w);
@@ -1637,7 +1847,7 @@ void xnu_returned(uint64_t log_pa, uint64_t len, uint64_t reason, uint64_t code,
 	dbg_puts("=== end of XNU log ===\n");
 	save_host_keep(&xsyms);
 	show_log_tail(40);
-	dbg_delay_ms(20000);
+	dbg_delay_ms(30000);
 	reset_board();
 }
 
@@ -2433,8 +2643,8 @@ static void __attribute__((noreturn)) run_xnu(void)
 		memset((void *)rd_pa, 0, rd_size);
 		memcpy((void *)rd_pa, pi.ramdisk, pi.ramdisk_size);
 	}
-	/* and the big one off the flash, if it is there (with XNU_ROOT_EMMC the kernel reads it itself) */
-	uint64_t sys_size = XNU_ROOT_EMMC ? 0 : load_system_image();
+	/* and the big one off the flash, if it is there (with XNU_ROOT_STORAGE the kernel reads it itself) */
+	uint64_t sys_size = XNU_ROOT_STORAGE ? 0 : load_system_image();
 	uint64_t sys_pa = sys_size ? SYSTEM_PA : 0;
 	uint64_t sys_span = (sys_size + PAGE_SIZE_MAX - 1) & ~(PAGE_SIZE_MAX - 1);
 
@@ -2483,8 +2693,7 @@ static void __attribute__((noreturn)) run_xnu(void)
 
 	out("md0 ");
 	out_hex(sys_size ? sys_pa : rd_pa);
-	out(sys_size ? " (the system image), md1 " : XNU_ROOT_EMMC ? " is none: md1 (root.packfs), the system image on the eMMC" :
-	    " (root.packfs only)");
+	out(sys_size ? " (the system image), md1 " : " (root.apfs only)");
 	if (sys_size) {
 		out_hex(rd_pa);
 	}
@@ -2657,7 +2866,7 @@ static void msdc1_probe(void)
 		out(") -- the slot needs its clock and power set up");
 	}
 	out("\n");
-	msdc_base = MSDC0_BASE;
+	msdc_base = MSDC_BASE;
 }
 
 static void msdc_self_test(void)
@@ -3145,7 +3354,8 @@ static void touch_hand_back(void)
  * (tools/boot-xnu.sh): ramoops keeps it in its pmsg zone across the reboot, where this finds it
  * and wipes it, so the boot after XNU is Android again.
  */
-static const char boot_xnu_flag[] = "DARWIN-REDWOOD:BOOT-XNU";
+static const char boot_xnu_flag[] = "DARWIN-LH8N:BOOT-XNU";
+static const char boot_xnu_flag_legacy[] = "DARWIN-REDWOOD:BOOT-XNU";
 
 /*
  * Whether Android left `flag` in the pmsg zone before rebooting, and if so wipe it, so it is taken
@@ -3175,12 +3385,13 @@ static int pmsg_take(const char *flag, uint32_t n)
 
 static int xnu_requested(void)
 {
-	return pmsg_take(boot_xnu_flag, sizeof(boot_xnu_flag) - 1);
+	if (pmsg_take(boot_xnu_flag, sizeof(boot_xnu_flag) - 1))
+		return 1;
+	return pmsg_take(boot_xnu_flag_legacy, sizeof(boot_xnu_flag_legacy) - 1);
 }
 
-static int boot_choice(void)
+static int boot_choice(int xnu)
 {
-	int xnu = MENU_DEFAULT_XNU || xnu_requested();
 	uint64_t screen = fbc.base;
 
 	fbc.base = 0;
@@ -3546,52 +3757,14 @@ void mtkloader_main(uint64_t dtb)
 	lk_dtb = dtb;
 	display_find();
 	fbcon_init(fb_base, fb_pitch, 0, 1);
-
-	/* If XNU completed its run or watchdog triggered, return to Android */
-	if (mark == MARK_DONE || mark == MARK_RUNNING) {
-		marker_set(0);
-		if (mark == MARK_RUNNING) {
-			rescue_log();
-			dbg_delay_ms(2000);
-		}
-		chain_android();
-	}
+	out("mtkloader entry (mark ");
+	out_hex(mark);
+	out(")\n");
 
 	marker_set(0);
 	plog_reset();
-#if TOUCH_PROBE
-	fb_rect(0, 0, PANEL_W, PANEL_H, 0xff000000u);
-	fbc.x = 0;
-	fbc.y = fbc.top = 0;
-	out("== mtkloader: touch screen probe ==\n");
-	touch_probe();
-	dbg_delay_ms(4000);
-	chain_android();
-#endif
-#if GPU_PROBE
-	if (pmsg_take(gpu_probe_flag, sizeof(gpu_probe_flag) - 1)) {
-		fb_rect(0, 0, PANEL_W, PANEL_H, 0xff000000u);
-		fbc.x = 0;
-		fbc.y = fbc.top = 0;
-		out("== mtkloader: GPU probe ==\n");
-		gpu_probe();
-		dbg_delay_ms(4000);
-	}
-	chain_android();
-#endif
-#if MSDC_TEST
-	fb_rect(0, 0, PANEL_W, PANEL_H, 0xff000000u);
-	fbc.x = 0;
-	fbc.y = fbc.top = 0;
-	out("== mtkloader: eMMC read test ==\n");
-	msdc_self_test();
-	dbg_delay_ms(4000);
-	wdt_disable();
-	chain_android();
-#endif
-	if (!boot_choice()) {
-		chain_android();
-	}
+
+	boot_choice(1);
 	fb_rect(0, 0, PANEL_W, PANEL_H, 0xff000000u);
 	fbc.x = 0;
 	fbc.y = fbc.top = 0;
@@ -3602,5 +3775,7 @@ void mtkloader_main(uint64_t dtb)
 	out_hex(dtb);
 	out("\n");
 	connsys_dt_report(dtb);         /* Wi-Fi step 1: what Android's tree says of CONNSYS (mtkconnsys.h) */
+	ufs_probe();
+	ufs_setup_shared();
 	run_xnu();
 }

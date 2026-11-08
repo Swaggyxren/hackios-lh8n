@@ -17,8 +17,12 @@
 #define MSDC0_BASE       0x11230000ULL
 #define MSDC1_BASE       0x11240000ULL   /* the SD card slot; LK leaves it alone */
 
+#ifndef MSDC_BASE
+#define MSDC_BASE        MSDC1_BASE   /* LH8n (MT6833) uses MSDC1 for MicroSD */
+#endif
+
 /* Which controller the calls below talk to; MSDC0 (the eMMC) unless set otherwise. */
-static uint64_t msdc_base = MSDC0_BASE;
+static uint64_t msdc_base = MSDC_BASE;
 
 #define MSDC_CFG         0x00
 #define MSDC_CFG_PIO     (1u << 3)
@@ -190,6 +194,89 @@ static int msdc_read(uint64_t lba, uint32_t blocks, void *dst)
 			return 0;
 		}
 	}
+	return 1;
+}
+
+static int msdc_init(void)
+{
+	static int msdc_initialized = 0;
+	if (msdc_initialized) {
+		return 1;
+	}
+	uint32_t resp;
+
+	msdc_base = MSDC1_BASE;
+	msdc_fifo_clear();
+
+	/* 1. Reset card: CMD0 (go idle, no response) */
+	wr32(msdc_base + MSDC_INT, rd32(msdc_base + MSDC_INT));
+	msdc_int_seen = 0;
+	wr32(msdc_base + SDC_ARG, 0);
+	wr32(msdc_base + SDC_CMD, CMD_OPC(0));
+	msdc_wait_int(INT_CMDRDY, INT_CMDTMO | INT_RSPCRCERR, "CMD0");
+	dbg_delay_ms(10);
+
+	/* 2. Check interface condition: CMD8 (0x1aa) -> response R7 */
+	wr32(msdc_base + SDC_ARG, 0x1aa);
+	wr32(msdc_base + SDC_CMD, CMD_OPC(8) | CMD_RSP_R1);
+	if (!msdc_wait_int(INT_CMDRDY, INT_CMDTMO | INT_RSPCRCERR, "CMD8")) {
+		return msdc_fail("CMD8 timeout", rd32(msdc_base + MSDC_INT));
+	}
+	resp = rd32(msdc_base + SDC_RESP0);
+	if ((resp & 0xff) != 0xaa) {
+		return msdc_fail("CMD8 pattern mismatch", resp);
+	}
+
+	/* 3. Send host capacity support & negotiate voltage (CMD55 + ACMD41) */
+	int ready = 0;
+	for (int i = 0; i < 100 && !ready; i++) {
+		dbg_delay_ms(10);
+		wr32(msdc_base + SDC_ARG, 0);
+		wr32(msdc_base + SDC_CMD, CMD_OPC(55) | CMD_RSP_R1);
+		if (!msdc_wait_int(INT_CMDRDY, INT_CMDTMO | INT_RSPCRCERR, "CMD55")) {
+			continue;
+		}
+		/* ACMD41: HCS (bit 30) | voltage 3.2-3.4V (0x00ff8000) */
+		wr32(msdc_base + SDC_ARG, 0x40ff8000u);
+		wr32(msdc_base + SDC_CMD, CMD_OPC(41) | (3u << 7)); /* R3 response (no CRC check) */
+		if (msdc_wait_int(INT_CMDRDY, INT_CMDTMO, "ACMD41")) {
+			resp = rd32(msdc_base + SDC_RESP0);
+			if (resp & 0x80000000u) { /* Card powerup ready bit */
+				ready = 1;
+				break;
+			}
+		}
+	}
+	if (!ready) {
+		return msdc_fail("ACMD41 ready timeout", rd32(msdc_base + MSDC_INT));
+	}
+
+	/* 4. Get CID: CMD2 (R2 136-bit response) */
+	wr32(msdc_base + SDC_ARG, 0);
+	wr32(msdc_base + SDC_CMD, CMD_OPC(2) | (2u << 7));
+	msdc_wait_int(INT_CMDRDY, INT_CMDTMO, "CMD2");
+
+	/* 5. Get RCA: CMD3 (R6 response) */
+	wr32(msdc_base + SDC_ARG, 0);
+	wr32(msdc_base + SDC_CMD, CMD_OPC(3) | CMD_RSP_R1);
+	if (!msdc_wait_int(INT_CMDRDY, INT_CMDTMO | INT_RSPCRCERR, "CMD3")) {
+		return msdc_fail("CMD3 failed", rd32(msdc_base + MSDC_INT));
+	}
+	uint32_t rca = rd32(msdc_base + SDC_RESP0) & 0xffff0000u;
+
+	/* 6. Select card into TRAN state: CMD7 (R1b response) */
+	wr32(msdc_base + SDC_ARG, rca);
+	wr32(msdc_base + SDC_CMD, CMD_OPC(7) | CMD_RSP_R1B);
+	if (!msdc_wait_int(INT_CMDRDY, INT_CMDTMO | INT_RSPCRCERR, "CMD7")) {
+		return msdc_fail("CMD7 failed", rd32(msdc_base + MSDC_INT));
+	}
+
+	/* 7. Set block length to 512 bytes: CMD16 (R1 response) */
+	wr32(msdc_base + SDC_ARG, 512);
+	wr32(msdc_base + SDC_CMD, CMD_OPC(16) | CMD_RSP_R1);
+	msdc_wait_int(INT_CMDRDY, INT_CMDTMO | INT_RSPCRCERR, "CMD16");
+
+	msdc_initialized = 1;
 	return 1;
 }
 

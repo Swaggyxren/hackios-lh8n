@@ -1,7 +1,7 @@
 # source this (from bash) before building XNU on Linux
 # Everything is found relative to this file. THEOS (default ~/theos) provides the cctools and the
 # Darwin SDK; XNU_SRC is the kernel tree (xnu/apply.sh creates it).
-DARWIN_REDWOOD=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+DARWIN_REDWOOD=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -L)
 export DARWIN_REDWOOD
 export XNU_HOST_OS=$(uname)
 # On macOS there is no theos: xnu-deps/setup.sh lays out xnu-deps/theos-mac like one (links to the

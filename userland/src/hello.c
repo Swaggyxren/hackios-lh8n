@@ -177,8 +177,14 @@ start(void)
 		}
 	}
 
-	/* Process 1 is not supposed to exit; doing so panics the kernel, which ends the test run. */
-	syscall3(SYS_exit, 0, 0, 0);
+	/*
+	 * Process 1 MUST NOT exit: in BSD/XNU, PID 1 termination immediately triggers
+	 * panic("initproc failed to start"). We stay alive in an infinite loop so the kernel
+	 * runs stably until loader_return_after hands control back to mtkloader.
+	 */
+	put(fd, "\n[LH8n] User space running stably (PID 1 alive).\n");
 	for (;;) {
+		long tv[2] = { 60, 0 };
+		syscall6(SYS_select, 0, 0, 0, 0, (long)tv, 0);
 	}
 }

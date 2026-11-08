@@ -1525,7 +1525,7 @@ main(int argc, char **argv, char **envp)
 	}
 
 	(void)envp;
-	if (argc > 0 && strncmp(argv[0], "/redwood/", 9) == 0) {
+	if ((argc > 0 && strncmp(argv[0], "/redwood/", 9) == 0) || getpid() == 1) {
 		base = "/redwood";
 	}
 	/* Not process 1: a command runner, "init FILE" (this is how a launchd job runs a list of commands). */

@@ -46,21 +46,15 @@ def build_v4(d, prog_path, out, payload):
     assert prog[0x38:0x3c] == b'ARM\x64', 'program has no arm64 header'
     assert len(prog) <= CHAIN_OFFSET, f'program too large ({len(prog)} > {CHAIN_OFFSET})'
 
-    total = CHAIN_OFFSET + linux_image_size
+    payload_off = CHAIN_OFFSET + len(pad(image, 16)) if payload else 0
+    total = max(CHAIN_OFFSET + linux_image_size, payload_off + len(payload))
     struct.pack_into('<Q', prog, 0x10, (total + 0xfffff) & ~0xfffff)
     struct.pack_into('<Q', prog, 0x28, len(image))
-
-    orig_rsize = len(ramdisk)
-    if payload:
-        padded_ramdisk = pad(ramdisk, page)
-        payload_off = len(padded_ramdisk)
-        new_ramdisk = padded_ramdisk + payload
-        struct.pack_into('<Q', prog, 0x20, orig_rsize)
-        struct.pack_into('<Q', prog, 0x30, payload_off)
-    else:
-        new_ramdisk = ramdisk
+    struct.pack_into('<Q', prog, 0x30, payload_off)
 
     blob = bytes(prog) + b'\0' * (CHAIN_OFFSET - len(prog)) + image
+    if payload:
+        blob = pad(blob, 16) + payload
 
     # Compress new kernel if original was compressed
     if kernel[:2] == b'\x1f\x8b':
@@ -70,9 +64,8 @@ def build_v4(d, prog_path, out, payload):
 
     hdr = bytearray(d[:page])
     struct.pack_into('<I', hdr, 8, len(new_kernel))  # update kernel_size
-    struct.pack_into('<I', hdr, 12, len(new_ramdisk))  # update ramdisk_size
 
-    img = bytes(hdr) + pad(new_kernel, page) + pad(new_ramdisk, page) + pad(signature, page)
+    img = bytes(hdr) + pad(new_kernel, page) + pad(ramdisk, page) + pad(signature, page)
     if len(img) > BOOT_PARTITION_V4:
         raise SystemExit(f'{out}: {len(img)} bytes exceeds boot partition size {BOOT_PARTITION_V4}')
 
