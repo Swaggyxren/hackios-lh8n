@@ -115,7 +115,7 @@ static const uint8_t core_order[8] = { 0, 7, 6, 1, 2, 3, 4, 5 };
 #define XNU_SERIAL          "HAKIOS0000000000"
 #endif
 #ifndef XNU_EXTRA_ARGS
-#define XNU_EXTRA_ARGS      "cpus=1 systrace=1 applog=1"
+#define XNU_EXTRA_ARGS      "cpus=1 systrace=1 applog=1 touchscreen=1"
 #endif
 /*
  * 1: the system image stays on the eMMC and the kernel reads it as it needs it (emmc_root=1,
