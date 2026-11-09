@@ -169,7 +169,7 @@ stage1() {
 		# (not a link: Xcode's ld looks itself up by the name it was called by, and knows no "ld64")
 		printf '#!/bin/sh\nexec "%s" "$@"\n' "$(/usr/bin/xcrun -f ld)" > host/bin/ld64.new && chmod +x host/bin/ld64.new && mv host/bin/ld64.new host/bin/ld64
 	else
-		printf '#!/bin/sh\nexport LD_LIBRARY_PATH="%s/../lib$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}"\nexec "%s" "$@"\n' "$CCTOOLS" "$CCTOOLS/ld" > host/bin/ld64.new && chmod +x host/bin/ld64.new && mv host/bin/ld64.new host/bin/ld64
+		printf '#!/bin/sh\nexport LD_LIBRARY_PATH="%s/../lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"\nexec "%s" "$@"\n' "$CCTOOLS" "$CCTOOLS/ld" > host/bin/ld64.new && chmod +x host/bin/ld64.new && mv host/bin/ld64.new host/bin/ld64
 	fi
 	link xnu-clang host/bin/xnu-clang++
 

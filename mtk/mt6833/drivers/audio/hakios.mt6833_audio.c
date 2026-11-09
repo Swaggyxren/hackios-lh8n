@@ -282,8 +282,11 @@ mt6833_afe_init(void)
 		        MT6833_I2C6_PHYS);
 	}
 
-	/* Zero the circular DMA playback buffer in Audio SRAM */
-	bzero((void *)sram_base, PLAYBACK_BUF_BYTES);
+	/* Zero the circular DMA playback buffer in Audio SRAM via 32-bit MMIO stores */
+	volatile uint32_t *sram_p = (volatile uint32_t *)sram_base;
+	for (size_t i = 0; i < PLAYBACK_BUF_BYTES / sizeof(uint32_t); i++) {
+		sram_p[i] = 0;
+	}
 	wr_pos = 0;
 
 	/* 1. Turn on Master AFE Engine and DAC at 48 kHz */

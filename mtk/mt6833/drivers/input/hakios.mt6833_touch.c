@@ -12,13 +12,24 @@
  *   GPIO Controller  : 0x10005000 (size 0x1000) [VERIFIED]
  *   TOPCKGEN Base    : 0x10000000 (size 0x1000) [VERIFIED]
  *   INFRACFG_AO Base : 0x10001000 (size 0x1000) [VERIFIED]
- *   Reset GPIO       : GPIO 19 (PIN_TOUCH_RST 19) [VERIFIED]
- *   Reset Timing     : 2 ms low pulse, 200 ms high recovery
- *                      Source: focaltech_noflash_common.ko fts_reset_proc (.text:0x634-0x6a8) [VERIFIED]
- *   IRQ GPIO         : GPIO 14 (PIN_TOUCH_IRQ 14, active-low EINT) [VERIFIED]
- *   SPI4 Clock Gate  : INFRACFG_AO + 0x00a8 (MODULE_SW_CG_0) bit 25 (ifrao_spi4) [UNVERIFIED for LH8n]
+ *   Power Regulator  : MT6360 PMU LDO2 (vtp) @ 1.8V (regulator-default-on = 1)
+ *                      Source: /sys/firmware/devicetree/base/i2c@11e01000/mt6360_pmu@34/ldo/ldo2 [VERIFIED]
+ *   Reset GPIO       : GPIO 19 (PIN_TOUCH_RST 19, fts_reset_gpio)
+ *                      Source: /sys/kernel/debug/gpio & pinctrl-mt6833.ko mtk_pins_mt6833 [VERIFIED]
+ *   Reset Pin Mode   : GPIO_MODE2 (0x10005320) bits [15:12] = 0x0 (GPIO mode)
+ *                      Source: pinctrl-mt6833.ko mtk_pins_mt6833 [VERIFIED]
+ *   Reset Direction  : GPIO_DIR0 (0x10005000) bit 19 = 1 (output)
+ *                      Source: pinctrl-mt6833.ko mt6833_data table at 0x3c10 [VERIFIED]
+ *   Reset DOUT / DIN : GPIO_DOUT0 (0x10005100) / GPIO_DIN0 (0x10005200) bit 19 [VERIFIED]
+ *   Reset Timing     : 2 ms low pulse, 200 ms recovery
+ *                      Source: focaltech_noflash_common.ko fts_reset_proc (.text:0x678-0x684) [VERIFIED]
+ *   IRQ GPIO         : GPIO 14 (PIN_TOUCH_IRQ 14, active-low EINT, fts_irq_gpio) [VERIFIED]
+ *   SPI4 Clock Gate  : INFRACFG_AO + 0x00a8 (MODULE_SW_CG_0) bit 25 (ifrao_spi4=0, un-gated) [VERIFIED]
  *   SPI4 Clock Mux   : TOPCKGEN + 0x0078 (CLK_CFG_7) bit 26 (spi_sel 26MHz) [UNVERIFIED for LH8n]
- *   SPI4 Pinmux Mode : GPIO 12/13/97/98 Mode 2 (SPI4_CLK, SPI4_CS, SPI4_MI, SPI4_MO) [UNVERIFIED for LH8n]
+ *   SPI4 Pinmux Mode : GPIO 12/13/97/98 Mode 2 (SPI4_CLK, SPI4_CSB, SPI4_MI, SPI4_MO)
+ *                      Source: pinctrl-mt6833.ko mtk_pins_mt6833 [VERIFIED]
+ *   SPI4 Pad Select  : Pad 0
+ *                      Source: /sys/firmware/devicetree/base/spi4@11018000/mediatek,pad-select = 0 [VERIFIED]
  *   Chip ID Read     : Register 0xA3 (2 bytes: 0x87, 0x25 / 0x87, 0x26) [VERIFIED]
  *                      Register 0x90 (2 boot ID bytes) [VERIFIED]
  *
@@ -65,6 +76,7 @@ extern void loader_log_putc(char c);
 #define GPIO_DOUT0              0x0100          /* Data out [31:0] */
 #define GPIO_DIN0               0x0200          /* Data in [31:0] */
 #define GPIO_MODE1              0x0310          /* Function mode for GPIO 8..15 */
+#define GPIO_MODE2              0x0320          /* Function mode for GPIO 16..23 */
 #define GPIO_MODE12             0x03c0          /* Function mode for GPIO 96..103 */
 
 #define PIN_TOUCH_IRQ           14              /* GPIO 14: Active-low EINT line for LH8n */
@@ -351,6 +363,80 @@ mt6833_touch_thread(__unused void *param, __unused wait_result_t res)
 	}
 }
 
+/*
+ * Layer 2: Power rails & hardware reset sequence.
+ *
+ * Hardware verification & citations (Tecno Pova 5 Pro 5G / LH8n):
+ *   Power Rail : MT6360 PMU LDO2 (vtp) @ 1.8V (regulator-default-on = 1)
+ *                Source: /sys/firmware/devicetree/base/i2c@11e01000/mt6360_pmu@34/ldo/ldo2 [VERIFIED]
+ *   Reset Pin  : GPIO 19 (fts_reset_gpio, pin 19)
+ *                Source: /sys/kernel/debug/gpio & pinctrl-mt6833.ko mtk_pins_mt6833 [VERIFIED]
+ *   Pin Mode   : GPIO_MODE2 (0x10005320) bits [15:12] = 0x0 (GPIO mode)
+ *                Source: pinctrl-mt6833.ko mtk_pins_mt6833 [VERIFIED]
+ *   Direction  : GPIO_DIR0 (0x10005000) bit 19 = 1 (output)
+ *                Source: pinctrl-mt6833.ko mt6833_data table at 0x3c10 [VERIFIED]
+ *   Output Reg : GPIO_DOUT0 (0x10005100) bit 19 [VERIFIED]
+ *   Input Reg  : GPIO_DIN0 (0x10005200) bit 19 [VERIFIED]
+ *   Reset Timing: 2 ms low pulse, 200 ms recovery
+ *                Source: focaltech_noflash_common.ko fts_reset_proc / fts_ts_probe_entry
+ *                (.text:0x678-0x684, 0x1740-0x174c) [VERIFIED]
+ */
+static bool
+mt6833_touch_reset(void)
+{
+	if (!gpio_regs) {
+		log_touch("mt6833_touch: cannot reset, GPIO registers unmapped\n");
+		return false;
+	}
+
+	/* 1. Log power rail state (LK/bootloader leaves MT6360 LDO2 vtp enabled at 1.8V) */
+	log_touch("mt6833_touch: power rail verified: MT6360 LDO2 vtp=1.8V (default-on)\n");
+
+	/* 2. Configure GPIO 19 as GPIO function (Mode 0) in GPIO_MODE2 */
+	uint32_t mode2 = gpio_rd(GPIO_MODE2);
+	mode2 &= ~(0xFu << 12);                 /* Pin 19: bits [15:12] = 0 (GPIO mode) */
+	gpio_wr(GPIO_MODE2, mode2);
+
+	/* 3. Configure GPIO 19 as OUTPUT in GPIO_DIR0 */
+	uint32_t dir0 = gpio_rd(GPIO_DIR0);
+	dir0 |= (1u << PIN_TOUCH_RST);          /* Pin 19 = output (1) */
+	gpio_wr(GPIO_DIR0, dir0);
+
+	/* Read initial pre-reset state */
+	uint32_t din_pre = gpio_rd(GPIO_DIN0);
+	log_touch("mt6833_touch: pre-reset state: rst_in=%u, irq_in=%u (DIR0=%#x, MODE2=%#x)\n",
+	          (din_pre >> PIN_TOUCH_RST) & 1, (din_pre >> PIN_TOUCH_IRQ) & 1,
+	          gpio_rd(GPIO_DIR0), gpio_rd(GPIO_MODE2));
+
+	/* 4. Assert reset LOW for 2 ms (stock focaltech timing: udelay(2000)) */
+	uint32_t dout0 = gpio_rd(GPIO_DOUT0);
+	dout0 &= ~(1u << PIN_TOUCH_RST);        /* Pin 19 = LOW */
+	gpio_wr(GPIO_DOUT0, dout0);
+	delay(2000);                            /* 2 ms low pulse */
+
+	/* 5. Deassert reset HIGH and allow 200 ms boot ROM recovery time */
+	dout0 = gpio_rd(GPIO_DOUT0);
+	dout0 |= (1u << PIN_TOUCH_RST);         /* Pin 19 = HIGH */
+	gpio_wr(GPIO_DOUT0, dout0);
+	delay(200000);                          /* 200 ms recovery */
+
+	/* 6. Verify post-reset line state */
+	uint32_t din_post = gpio_rd(GPIO_DIN0);
+	uint32_t rst_state = (din_post >> PIN_TOUCH_RST) & 1;
+	uint32_t irq_state = (din_post >> PIN_TOUCH_IRQ) & 1;
+
+	log_touch("mt6833_touch: post-reset state: rst_in=%u (expected 1), irq_in=%u (expected 1, idle)\n",
+	          rst_state, irq_state);
+
+	if (rst_state != 1) {
+		log_touch("mt6833_touch: warning: reset line failed to return HIGH\n");
+		return false;
+	}
+
+	log_touch("mt6833_touch: Layer 2 reset sequence successful (pulse=2ms, recovery=200ms)\n");
+	return true;
+}
+
 /* --- Public Driver Interface for sys/hakios.input.h --- */
 
 void
@@ -397,16 +483,24 @@ hakios_tcm_init(void)
 	uint32_t cg0 = infracfg_rd(0x00a8);
 	uint32_t clk_cfg7 = topckgen_rd(0x0078);
 	uint32_t gpio_mode1 = gpio_rd(0x0310);
+	uint32_t gpio_mode2 = gpio_rd(GPIO_MODE2);
 	uint32_t gpio_mode12 = gpio_rd(0x03c0);
 	uint32_t gpio_din0 = gpio_rd(0x0200);
 
-	log_touch("mt6833_touch: HW snapshot: CG0=%#x (spi4_cg=%u) CLK_CFG7=%#x MODE1=%#x MODE12=%#x DIN0=%#x (irq_pin%u=%u)\n",
-	          cg0, (cg0 >> 25) & 1, clk_cfg7, gpio_mode1, gpio_mode12, gpio_din0,
-	          PIN_TOUCH_IRQ, (gpio_din0 >> PIN_TOUCH_IRQ) & 1);
+	log_touch("mt6833_touch: HW snapshot: CG0=%#x (spi4_cg=%u) CLK_CFG7=%#x MODE1=%#x MODE2=%#x MODE12=%#x DIN0=%#x (irq_pin%u=%u, rst_pin%u=%u)\n",
+	          cg0, (cg0 >> 25) & 1, clk_cfg7, gpio_mode1, gpio_mode2, gpio_mode12, gpio_din0,
+	          PIN_TOUCH_IRQ, (gpio_din0 >> PIN_TOUCH_IRQ) & 1,
+	          PIN_TOUCH_RST, (gpio_din0 >> PIN_TOUCH_RST) & 1);
 
 	bzero(contacts, sizeof(contacts));
 
+	/* Layer 2: Power and reset sequence */
+	if (!mt6833_touch_reset()) {
+		log_touch("mt6833_touch: Layer 2 reset sequence failed\n");
+		return;
+	}
+
 	/* Note: Touch monitoring thread will be started in Layer 5 after SPI/IRQ bringup */
-	log_touch("mt6833_touch: Layer 1 probe successful, rst=GPIO%u, irq=GPIO%u, MMIO ready\n",
+	log_touch("mt6833_touch: Layer 2 power & reset sequence complete, rst=GPIO%u, irq=GPIO%u\n",
 	          PIN_TOUCH_RST, PIN_TOUCH_IRQ);
 }
