@@ -1525,6 +1525,10 @@ goodix_thread(__unused void *parameter, __unused wait_result_t result)
 void
 hakios_goodix_init(void)
 {
+#if defined(HAKIOS_MT6833_TOUCH) || defined(CONFIG_HAKIOS_MT6833_TOUCH) || defined(CONFIG_SOC_MT6833)
+	/* MediaTek MT6833: Qualcomm Goodix/TLMM driver must never probe or bitbang SPI pins */
+	return;
+#endif
 	uint32_t enabled = 0;
 	thread_t thread;
 

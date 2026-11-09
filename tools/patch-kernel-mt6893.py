@@ -80,6 +80,12 @@ PATCHES = [
 	("IOMobileFramebuffer::show: the check that is not done here",
 	 "01f9ff54c4ffff1797f6ffb5e86340f948f60736",
 	 "01f9ff54c4ffff17b4ffff17e86340f948f60736"),
+
+	# _hakios_goodix_init: Qualcomm touch driver disabled on MT6833/LH8n so it never
+	# touches TLMM or bitbangs pins by hand.
+	("hakios_goodix_init: return immediately on MT6833",
+	 "ff8300d1fd7b01a9fd430091bfc31fb8ff0300f900e0fff000302391a11300d1",
+	 "c0035fd6fd7b01a9fd430091bfc31fb8ff0300f900e0fff000302391a11300d1"),
 ]
 
 
