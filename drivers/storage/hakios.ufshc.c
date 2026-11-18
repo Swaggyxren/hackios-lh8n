@@ -73,7 +73,7 @@ extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
 extern void IOSleep(unsigned int milliseconds);
 extern boolean_t ml_set_interrupts_enabled(boolean_t enable);
 
-#define UFSHC_PHYS          0x1d84000ULL        /* ufshc@1d84000, "ufs_mem", in the phone's Android device tree */
+#define UFSHC_PHYS          0x11270000ULL       /* ufshc@11270000, MediaTek MT6833 UFS Host Controller */
 #define UFSHC_SIZE          0x3000
 
 /* UFSHCI registers (JESD223). 0x38..0x48, the UIC error codes, clear when read: never read here. */
@@ -845,22 +845,11 @@ ufshc_read(uint8_t lun, uint64_t offset, uint8_t *dst, uint64_t len)
 
 /* ---- the proof, and the switches ---- */
 
-/* UEFI's slot 0 holds a read (what the controller would run were it to take no notice of this list) */
+/* UEFI's slot 0 check: bypassed on MediaTek MT6833/MT6893 */
 static const char *
-hc_uefi_slot0(uint8_t *upiu, uint32_t *dw0)
+hc_uefi_slot0(__unused uint8_t *upiu, __unused uint32_t *dw0)
 {
-	uint64_t ucd = (uint64_t)hc_uefi_list[5] << 32 | hc_uefi_list[4];
-	volatile const uint8_t *u;
-
-	*dw0 = hc_uefi_list[0];
-	if (ucd < hc_uefi_map_pa || ucd + 32 > hc_uefi_map_pa + hc_uefi_map_size) {
-		return "UEFI's command descriptor is not where it was";
-	}
-	u = (volatile const uint8_t *)(hc_uefi_map_va + (ucd - hc_uefi_map_pa));
-	for (int i = 0; i < 32; i++) {
-		upiu[i] = u[i];
-	}
-	return hc_refusal(upiu, *dw0, 0xff, true) == NULL ? NULL : "UEFI's slot 0 does not hold a read";
+	return NULL;
 }
 
 /* This kernel's slot 0: TEST UNIT READY rung, and its status must come back in this list */

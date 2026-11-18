@@ -1,84 +1,64 @@
-# HakiOS Darwin / XNU Bringup on Tecno Pova 5 Pro 5G (LH8n / MT6833) — Handoff Document
+# HakiOS on Tecno Pova 5 Pro 5G (`LH8n` / `MT6833`) — Handoff & Status
 
-**Date**: November 8, 2026  
-**Target Hardware**: Tecno Pova 5 Pro 5G (`LH8n`), MediaTek Dimensity 6080 (`MT6833` / `MT6768` family)  
-**Kernel Target**: Apple Darwin 22.5.0 / XNU 8796.121.2 (iOS 16.5)  
-**Status**: Paused after Phase 7 (Full Graphical iOS SpringBoard Homescreen Boot verified; awaiting native physical touch driver implementation).
-
----
-
-## 1. What Has Been Achieved
-
-1. **Bootloader Chain & DRAM Payload Staging**:
-   - `mtkloader` chained in Android boot header v4 on slot A (`xnu-flashed-slot_a.img`).
-   - `vendor_boot_payload.img` loaded by Little Kernel DMA into DRAM at `0x51100000`, unpacked at `0x52f0e000`.
-   - Kernel memory base `0xc0000000`, entry point `0xc34424a8`.
-   - Framebuffer mapped at `0x76950000`, 1080x2460, stride 4352.
-
-2. **Native UFS 2.2 Controller Handover & Storage Root Pivot**:
-   - Little Kernel UFS controller (`0x11270000`) handed over cleanly with active transfer lists at `0x80210000` (32 command slots) and shared page at `0x80200000`.
-   - Kernel binary patched (`tools/patch-kernel-mt6893.py`) to bind `UFSHC_PHYS` to `0x11270000`.
-   - `init` mounts iOS root filesystem from `/dev/ufs_xnusys` (sdc59) at `/flash`.
-   - VFS root switch executed via `kern.hakios_switch_root`: Darwin volume becomes `/`, bootstrap ramdisk mounted on `/private/preboot`.
-   - Cryptexes mounted at `/System/Cryptexes/OS` and `/System/Cryptexes/App` for dyld Shared Cache.
-
-3. **PID 1 Handover & Darwin Ignition**:
-   - `init` patches applied at byte offset `0x5a0` (`1f 20 03 d5` NOP) so `base = "/redwood"` remains intact when launched as `/sbin/launchd`.
-   - Process 1 hands off cleanly via `/redwood/etc/rc`: `exec /sbin/launchd.darwin`.
-   - Native Apple system daemons run resident without watchdog timeout (`loader_return_after=0`):
-     - `launchd.darwin[1]`
-     - `containermanagerd[12]`
-     - `usermanagerd[15]`
-     - `lsd[26]`
-     - `backboardd` (Event dispatch & WindowServer client)
-     - `SpringBoard[7]` (iOS Shell / Compositor)
-
-4. **Graphical Homescreen Verified**:
-   - Full graphical iOS 16.5 homescreen, wallpaper, dock, and app icons render live on the device panel.
+**Last Updated:** 2026-11-09 19:10 (+08:00)  
+**Device:** Tecno Pova 5 Pro 5G (`LH8n`, MediaTek Dimensity 6080 / `MT6833`, ADB serial `H333LH8NU0123456`)  
+**Repository:** `/home/ydnar/Documents/LH8n Tree sar/hakios-lh8n` (branch `mtk`, HEAD `fb90864`)
 
 ---
 
-## 2. Touch Subsystem Findings & Current State
-
-### Hardware Device Tree Details (from `dtbo.img` `/fragment@17`):
-- **Touch IC**: FocalTech FT8726 (`focaltech,fts` / `tchip,ilitek`)
-- **Bus**: MediaTek `spi4` at `0x11018000` (max frequency 8 MHz = `0x007a1200`)
-- **IRQ GPIO**: GPIO 14 (`touch,irq-gpio` = 14, active-low)
-- **RST GPIO**: GPIO 19 (`touch,reset-gpio` = 19)
-- **Resolution**: 1080 x 2460
-- **Android Driver**: `focaltech_noflash_common.ko`
-
-### Current Obstacles:
-1. **Prebuilt Kernel Stub**:
-   - In `mach.development.mt6833`, `hakios_tcm_init()` is a no-op stub (`drivers/core/hakios.stubs.c`). The MT6833 touch code (`bsd/dev/hakios.mt6833_touch.c`) was never compiled into the prebuilt kernel binary.
-   - Rebuilding XNU from source (`xnu-src/`) previously produced unbootable kernels and broke userland stability, so a non-destructive integration path is needed.
-2. **Scripted Touch (`rwtouch`) Token Limit Fix**:
-   - Discovered that `userland/src/init.c`'s `run_command()` has a hard limit of 63 tokens (`char *argv[64]; argc < 63`).
-   - Long chained commands in `/redwood/etc/rc.jobs` get truncated, dropping trailing commands and arguments.
-   - Fixed by formatting gestures into discrete lines with `sleep` intervals (`userland/rc.jobs.lh8n`).
-
-### Community Prior Art & References:
-- **Reddit Reference**: [r/hackios: the github repo with a bunch of repos combined](https://www.reddit.com/r/hackios/comments/1xpcawt/the_github_repo_with_a_bunch_of_repos_combined/) points to `Chromitsune/Portsmith-iOS` and `oosexgang/hakios-xnu-kernel`.
-- **Telegram Chat Exports**: `ChatExport_2026-11-07` (`oosexgang comment`). Traced HakiOS 2.3.4 touch latency fix (~5ms finger lift) and SakuraKyuo's Corvette touch implementation (`SakuraKyuo/hackios-xnu-kernel_corvette` commit `120f063a`), clamping coordinates and capping `MOVE` events at 125 Hz.
+## 1. Where We Left Off
+- **Device State:** Running stock Android (`boot_a` and `vendor_boot_a` restored from `/home/ydnar/Downloads/boot.img` and `/home/ydnar/Downloads/vendor_boot_a_backup.img`), connected over `adb` (`H333LH8NU0123456`).
+- **Latest Pulled Log:** `/sys/fs/pstore/console-ramoops-0` saved to [logs/pstore-latest.log](file:///home/ydnar/Documents/LH8n%20Tree%20sar/hakios-lh8n/logs/pstore-latest.log).
+- **Latest Built Images (2026-11-09 18:37, not yet flashed):**
+  - [hakios-kernel](file:///home/ydnar/Documents/LH8n%20Tree%20sar/hakios-lh8n/hakios-kernel) (`Darwin Kernel Version 22.5.0: Lun 09 Nob 2026 06:35:39 N.H. PST`)
+  - [build-payload.bin](file:///home/ydnar/Documents/LH8n%20Tree%20sar/hakios-lh8n/build-payload.bin) (`19,148,744` bytes)
+  - [xnu-flashed-slot_a.img](file:///home/ydnar/Documents/LH8n%20Tree%20sar/hakios-lh8n/xnu-flashed-slot_a.img) (`19,820,544` bytes)
+  - [vendor_boot_payload.img](file:///home/ydnar/Documents/LH8n%20Tree%20sar/hakios-lh8n/vendor_boot_payload.img) (`50,864,128` bytes)
 
 ---
 
-## 3. Backups & Staged Images
+## 2. Current Problems We Are Having
 
-- **Stock `boot_a`**: `/home/ydnar/Downloads/boot.img` (40,894,464 bytes)
-- **Stock `vendor_boot_a`**: `/home/ydnar/Downloads/vendor_boot_a_backup.img` (67,108,864 bytes)
-- **Working Boot Image**: `/home/ydnar/Documents/LH8n Tree sar/hakios-lh8n/xnu-flashed-slot_a.img` (19,820,544 bytes)
-- **Working Payload Image**: `/home/ydnar/Documents/LH8n Tree sar/hakios-lh8n/vendor_boot_payload.img` (52,719,616 bytes)
-- **Gesture Template**: `/home/ydnar/Documents/LH8n Tree sar/hakios-lh8n/userland/rc.jobs.lh8n`
+### Problem A: Touchscreen (`FT8726` on `SPI4`) Unresponsive in iOS
+- When XNU boots into the iOS 16.5 `SpringBoard` homescreen, touch input does not register.
+- **Root Causes Identified (from stock `focaltech_noflash_common.ko`, `spi-mt65xx.ko`, `clk-mt6833.ko`, `clk-mt6833-bus.ko`):**
+  1. [`spi4_transfer_bytes`](file:///home/ydnar/Documents/LH8n%20Tree%20sar/hakios-lh8n/mtk/mt6833/drivers/input/hakios.mt6833_touch.c#L239-L327) checked `SPI_STATUS1_REG` (`+0x20`), where bit 0 is `1` when `IDLE`, causing transfers to abort on spin 0 before the 26 MHz SPI clock domain latched `SPI_CMD_ACT`.
+  2. [`mt6833_touch_hw_init`](file:///home/ydnar/Documents/LH8n%20Tree%20sar/hakios-lh8n/mtk/mt6833/drivers/input/hakios.mt6833_touch.c#L823-L875) had `INFRACFG_AO` `ifrao_spi4` `clr_ofs` (`+0x00a8`) and `sta_ofs` (`+0x00ac`) swapped and did not un-gate `TOPCKGEN` `spi_sel` (`CLK_CFG_6_CLR = +0x0078` bit 23).
+  3. `FT8726` uses `IRQF_TRIGGER_FALLING` (`0x2002`) pulses on `GPIO 14` rather than holding a level-low interrupt across `8 ms` polling intervals.
+- **Status:** Fixes are implemented and compiled into [xnu-flashed-slot_a.img](file:///home/ydnar/Documents/LH8n%20Tree%20sar/hakios-lh8n/xnu-flashed-slot_a.img) and [vendor_boot_payload.img](file:///home/ydnar/Documents/LH8n%20Tree%20sar/hakios-lh8n/vendor_boot_payload.img), plus live `ramoops` logging via [`ramoops_live_putc`](file:///home/ydnar/Documents/LH8n%20Tree%20sar/hakios-lh8n/mtk/mt6833/drivers/input/hakios.mt6833_touch.c#L183-L214) to `0x480ef000ULL`, awaiting hardware verification.
+
+### Problem B: Getting Stuck on White Console Log Lines (`[FAIL] mount the iOS volume read only` / `CPU halted`)
+- **What [logs/pstore-latest.log](file:///home/ydnar/Documents/LH8n%20Tree%20sar/hakios-lh8n/logs/pstore-latest.log) Shows:**
+  - Lines 108–111: `LK initrd: 0x51100000 .. 0x544122ea` loaded an older `19,066,272`-byte payload at `0x52ed6000` (`Darwin Kernel Version 22.5.0: Lun 09 Nob 2026 03:55:34 N.H. PST`).
+  - Line 402: `ufs: native: not used: the loader offers no area for a list (or not one as expected: controller 11270000, area 80210000 of 69632, command descriptors at 4096 of 2048)` — it fell back to the loader's shared page, which timed out after 20s (`ufs: no answer from the loader to request 1 in 20 s`).
+  - Lines 448–450 & 1155–1179: `mount /dev/ufs_xnusys: Input/output error` → `[FAIL] mount the iOS volume read only` → `/sbin/launchd.darwin: No such file or directory` → `CPU halted` (leaving the device stuck on the white console text lines).
+- **Why an Older Payload or Mismatched `ufs_shared_pa` Area Occurred:**
+  1. [mtk/tools/repack_vendor_boot.py](file:///home/ydnar/Documents/LH8n%20Tree%20sar/hakios-lh8n/mtk/tools/repack_vendor_boot.py) updates `vrsize` in the Boot Header v4 header (offset `24`), but does **not** update the v4 vendor ramdisk table entry's `ramdisk_size` (`entry 0` at `table_off + 0`, which stays `31,512,105` / `0x1e0d629`). If LK's v4 loader reads `entry 0` from the vendor ramdisk table instead of the top-level `vrsize`, or if `xnu-flashed-slot_a.img` (`mtkloader`) is out of sync with `vendor_boot_payload.img`, either the payload is truncated/missed or `mtkloader`'s `ufs_shared` layout (`69,632` bytes vs `73,728` bytes) mismatches the kernel's `ufs_native_attach` check in [drivers/storage/hakios.ufshc.c](file:///home/ydnar/Documents/LH8n%20Tree%20sar/hakios-lh8n/drivers/storage/hakios.ufshc.c).
+
+---
+
+## 3. Completed & Verified Earlier
+1. **Native UFS 2.2 Storage & APFS Root Mount (`ufs_xnusys`):**
+   - Fixed `UFSHC_PHYS` (`0x11270000ULL`) in [drivers/storage/hakios.ufshc.c](file:///home/ydnar/Documents/LH8n%20Tree%20sar/hakios-lh8n/drivers/storage/hakios.ufshc.c) and [mtk/mt6833/drivers/storage/hakios.mt6833_ufs.c](file:///home/ydnar/Documents/LH8n%20Tree%20sar/hakios-lh8n/mtk/mt6833/drivers/storage/hakios.mt6833_ufs.c).
+   - Fixed `ufs_find_xnusys()` in [drivers/storage/hakios.ufs.c](file:///home/ydnar/Documents/LH8n%20Tree%20sar/hakios-lh8n/drivers/storage/hakios.ufs.c) to use `ufs_shared_pa=0x80200000` (`start_lba = 975616`, `count_lba = 3145728`).
+2. **iOS 16.5 Homescreen (`SpringBoard`) Boot:**
+   - Confirmed on hardware when `mtkloader` and `vendor_boot_payload.img` were in sync.
 
 ---
 
 ## 4. Next Steps When Resuming
-
-1. **Proper Physical Touch Implementation**:
-   - Wire MT6833 SPI4 controller registers (`0x11018000`) and GPIO 14 into XNU without full source recompile (e.g. surgical binary patch hooking `hakios_input_init()` or a targeted external driver shim).
-   - Verify SPI4 clocks are kept enabled by Little Kernel across the handover.
-2. **Hardware Buttons**:
-   - Map volume up/down and power keys via MT6833 PMIC/GPIO registers into `/dev/hakios-touch`.
-3. **Audio / Wi-Fi**:
-   - Audio DMA (AFE + AW87389 amplifier) and MT6631/MT6833 connsys Wi-Fi initialization.
+1. **Check `ufs_shared` area size & `repack_vendor_boot.py` v4 table:**
+   - Verify `mtkloader.c` `ufs_setup_shared()` area size matches `hakios.ufshc.c` (`area 80210000` size check) and update `repack_vendor_boot.py` to also patch `vr_table` entry 0's `ramdisk_size`.
+2. **Flash & Test Touch on iOS Homescreen:**
+   ```bash
+   adb reboot bootloader
+   fastboot flash boot_a "/home/ydnar/Documents/LH8n Tree sar/hakios-lh8n/xnu-flashed-slot_a.img"
+   fastboot flash vendor_boot_a "/home/ydnar/Documents/LH8n Tree sar/hakios-lh8n/vendor_boot_payload.img"
+   fastboot reboot
+   ```
+3. **Restore Stock Android:**
+   ```bash
+   fastboot flash boot_a /home/ydnar/Downloads/boot.img
+   fastboot flash vendor_boot_a /home/ydnar/Downloads/vendor_boot_a_backup.img
+   fastboot reboot
+   ```

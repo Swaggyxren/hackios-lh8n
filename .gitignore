@@ -109,6 +109,10 @@ __pycache__/
 !/xnuloader/im4p.py
 !/xnuloader/mkidentity.sh
 
+# FT8726 touch firmware is vendor property: generate the driver's header from the firmware the
+# user pulled from their own phone (mtk/tools/mk-ft8726-fw.py), never track the generated header.
+mtk/mt6833/drivers/input/hakios.ft8726_fw.h
+
 # the phone vendor's UEFI drivers, and the UEFI image built with them: proprietary, so never tracked. They
 # stay on the disk of whoever extracted them from their own phone (uefi/README.md).
 /devices/*/uefi/files/Binaries/*/*

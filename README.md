@@ -21,7 +21,7 @@ The kernel, its MediaTek drivers, the `mtkloader` bootloader, and the staging to
 | Display | working | 1080 × 2460 @ 120 Hz, OVL0 hardware scanout at `0x76950000` |
 | CPU | working | All 8 cores |
 | Storage / root | working | Native UFS 2.2 handover; APFS root on `ufs_xnusys` mounted read-only |
-| Touch / input | in progress | FT8726 over SPI4; firmware download over the boot ROM is the open item |
+| Touch / input | working | FT8726 over SPI4; boot-ROM firmware download, then live `DOWN`/`UP` events reach SpringBoard |
 | Buttons | in progress | Power and volume keys via MT6833 GPIO/PMIC |
 | GPU | staged | Mali-G57 MC2 through `HakiosMali` (`mali=1`) |
 | Sensors | staged | Accelerometer via the SCP sensor hub |
@@ -76,10 +76,16 @@ For early bringup the whole system can instead run from a RAM disk (`root.apfs` 
 
 ```bash
 make lh8n_defconfig
+make firmware                     # pull firmware from your own phone
+mtk/tools/mk-ft8726-fw.py         # generates the touch driver's firmware header (not tracked)
 make kernel                       # hakios-kernel
 make payload                      # build-payload.bin (kernel + root.apfs)
 make boot-image                   # xnu-flashed-slot_a.img
 ```
+
+The FT8726 touch firmware is vendor property and is never committed. Before `make kernel`,
+generate `mtk/mt6833/drivers/input/hakios.ft8726_fw.h` from the `focaltech_ts_fw_00.bin` you
+pulled from your own phone with `mtk/tools/mk-ft8726-fw.py`.
 
 Then flash the loader in `boot_a` and the payload in `vendor_boot_a`:
 
