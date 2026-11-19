@@ -64,7 +64,12 @@
 #ifndef XNU_CORES
 #define XNU_CORES           4
 #endif
-_Static_assert(XNU_CORES >= 1 && XNU_CORES <= 7, "one core at least, and one left for the watcher");
+/*
+ * LH8n has 8 cores; with the watcher disabled (XNU_WATCH_SECONDS=0) none is reserved for it, so
+ * all 8 can be offered to XNU. WATCH_CORE below is only read by watcher_start(), which returns
+ * immediately when the watcher is off, so WATCH_CORE may point one past core_order in that case.
+ */
+_Static_assert(XNU_CORES >= 1 && XNU_CORES <= 8, "one core at least, at most all eight on LH8n");
 
 /*
  * The processors in the order the kernel is offered them: the one this code runs on first (LK
@@ -72,7 +77,7 @@ _Static_assert(XNU_CORES >= 1 && XNU_CORES <= 7, "one core at least, and one lef
  * the rest of the A55s. So "cpus=3" already gives iOS both fast cores.
  */
 static const uint8_t core_order[8] = { 0, 7, 6, 1, 2, 3, 4, 5 };
-#define WATCH_CORE          core_order[XNU_CORES]
+#define WATCH_CORE          core_order[(XNU_CORES < 8) ? XNU_CORES : 7]
 /* Checkpoint for XNU to return at (osfmk/arm/arm_init.c LOADER_CHECKPOINT), 0 = none. */
 #ifndef XNU_CHECKPOINT
 #define XNU_CHECKPOINT      0
@@ -2454,35 +2459,260 @@ static uint8_t touch_bring_up(void)
 /* ---- the big cores' clock ---- */
 
 /*
- * LK leaves the big cluster (Cortex-A75) at 1087 MHz with its rail at 800 mV. MediaTek's own table
- * for this chip (cpufreq_v1, mach/mt6768, "OPP table B") runs it at 1176 MHz at that very voltage,
- * so it goes there: no rail is touched. The cluster is still off while the loader runs -- XNU wakes
- * those cores later -- so nothing is executing on the PLL while it is reprogrammed.
+ * MT6833 (LH8n): the CPU PLLs are SWAPPED versus the MT6768 file this came from.
+ * Verified from LH8n's clk-mt6833.ko (apmixedsys plls):
+ *   armpll_ll  (A55 little): CON0 0x208, CON1 0x20c  -- LK leaves at 1812 MHz (already fast)
+ *   armpll_bl0 (A76 BIG):    CON0 0x218, CON1 0x21c  -- LK leaves at 724 MHz  (the bug)
+ *   ccipll     (bus):        CON0 0x258, CON1 0x25c
+ * The old code wrote 0x20c (the little-core PLL, already at target) and silently bailed,
+ * so the two A76 big cores stayed at 724 MHz the whole time.
  *
- * ARMPLL_CON1 (apmixedsys + 0x20c): bit 31 asks for the new value, bits 24..26 the post divider
- * (here /2), bits 0..21 the multiplier of 26 MHz / 2^14 -- the same write the vendor's GPU driver
- * makes to its PLL.
+ * CON1: bit 31 requests the new value, bits 24..26 the post divider (div = 2^posdiv),
+ * bits 0..21 the multiplier of 26 MHz / 2^14. LK leaves armpll_bl0 at 724 MHz which is
+ * posdiv=2 (VCO ~2896) -- do NOT bail on post != 1. Program posdiv=1 (/2) for
+ * 1418 MHz (VCO 2836): MT6833 MT_CPU_DVFS_L OPP #8 = 1418 MHz @ 787.5 mV, which is
+ * BELOW LK's 800 mV rail, so no voltage is changed. pcw = (2836 * 16384)/26 = 0x1b44ec.
  */
 #define APMIXED_BASE        0x1000c000ULL
-#define ARMPLL_CON1         0x20c
-#define BIG_MHZ             1176u
+#define ARMPLL_LL_CON0      0x208u
+#define ARMPLL_LL_CON1      0x20cu
+#define ARMPLL_BL0_CON0     0x218u
+#define ARMPLL_BL0_CON1     0x21cu
+#define CCIPLL_CON0         0x258u
+#define CCIPLL_CON1         0x25cu
+#define BIG_MHZ             1418u
+#define BIG_POST            1u
+#define BIG_PCW             (((uint64_t)BIG_MHZ << BIG_POST) * 16384u / 26u)  /* 0x1b44ec */
+/* CCI (bus) PLL (CCIPLL_CON1 0x25c) is intentionally left at LK stock (674 MHz):
+ * raising it to 1210 MHz regressed smoothness on this board (see B6/B7 logs). */
+
+/* MHz a CON1 encodes: (26 * pcw / 2^14) / 2^postdiv. */
+static inline uint32_t pll_mhz(uint32_t con1)
+{
+	uint32_t post = (con1 >> 24) & 7u;
+
+	return (uint32_t)(((26ull * (con1 & 0x3fffffu)) >> 14) >> post);
+}
+
+/*
+ * Read-only MT6833 PMIC voltage probe (MT6359P) through PWRAP.
+ * Decoded from LH8n's own mtk-pmic-wrap.ko (mt6833_regs + pwrap_read16): MT6833 uses
+ * the v2 SWINF_2 interface, NOT the v1 WACS2 offsets in hakios.mt6833_keys.c (0xc80/0xca4/0xca8)
+ * nor MT6768's mtkpwrap.h. FSM is bits 3:1 of SWINF_2_STA (NOT bits 18:16): 0=IDLE, 6=WFVLDCLR.
+ * No PMIC writes are made: only the ACC read command + VLD_CLR acknowledge.
+ */
+#define MT6833_PWRAP_BASE   0x10026000ULL
+#define SWINF2_WDATA        0x0884u
+#define SWINF2_ACC          0x0880u
+#define SWINF2_RDATA        0x0894u
+#define SWINF2_VLD_CLR      0x08a4u
+#define SWINF2_STA          0x08a8u
+#define PWRAP_FSM_R(r)      (((r) >> 1) & 7u)     /* STA bits 3:1 */
+#define PWRAP_FSM_IDLE_R    0u
+#define PWRAP_FSM_WFVLDCLR_R 6u
+#define SWINF2_ACC_WRITE    (1u << 29)            /* ACC bit 29 = write (from mtk-pmic-wrap.ko) */
+
+static int
+pwrap_read_ro(uint32_t reg, uint16_t * value)
+{
+	uint32_t r;
+
+	for (uint32_t spin = 0; spin < 100000; spin++) {
+		if (PWRAP_FSM_R(rd32(MT6833_PWRAP_BASE + SWINF2_STA)) == PWRAP_FSM_IDLE_R) {
+			break;
+		}
+	}
+	if (PWRAP_FSM_R(rd32(MT6833_PWRAP_BASE + SWINF2_STA)) != PWRAP_FSM_IDLE_R) {
+		return 0;
+	}
+	wr32(MT6833_PWRAP_BASE + SWINF2_ACC, reg);       /* raw reg, no shift */
+	for (uint32_t spin = 0; spin < 100000; spin++) {
+		r = rd32(MT6833_PWRAP_BASE + SWINF2_STA);
+		if (PWRAP_FSM_R(r) == PWRAP_FSM_WFVLDCLR_R) {
+			break;
+		}
+	}
+	if (PWRAP_FSM_R(r) != PWRAP_FSM_WFVLDCLR_R) {
+		return 0;
+	}
+	*value = (uint16_t)(rd32(MT6833_PWRAP_BASE + SWINF2_RDATA) & 0xffffu);
+	wr32(MT6833_PWRAP_BASE + SWINF2_VLD_CLR, 1);
+	return 1;
+}
+
+/* Write a 16-bit PMIC register through MT6833 v2 SWINF_2 (WDATA 0x884, ACC 0x880 bit 29).
+ * Sequence from LH8n's mtk-pmic-wrap.ko: wait IDLE -> WDATA=val -> ACC=(1<<29)|reg -> wait IDLE. */
+static int
+pwrap_write16(uint32_t reg, uint16_t val)
+{
+	for (uint32_t spin = 0; spin < 100000; spin++) {
+		if (PWRAP_FSM_R(rd32(MT6833_PWRAP_BASE + SWINF2_STA)) == PWRAP_FSM_IDLE_R) {
+			break;
+		}
+	}
+	if (PWRAP_FSM_R(rd32(MT6833_PWRAP_BASE + SWINF2_STA)) != PWRAP_FSM_IDLE_R) {
+		return 0;
+	}
+	wr32(MT6833_PWRAP_BASE + SWINF2_WDATA, val);
+	wr32(MT6833_PWRAP_BASE + SWINF2_ACC, SWINF2_ACC_WRITE | reg);
+	for (uint32_t spin = 0; spin < 100000; spin++) {
+		if (PWRAP_FSM_R(rd32(MT6833_PWRAP_BASE + SWINF2_STA)) == PWRAP_FSM_IDLE_R) {
+			break;
+		}
+	}
+	return PWRAP_FSM_R(rd32(MT6833_PWRAP_BASE + SWINF2_STA)) == PWRAP_FSM_IDLE_R;
+}
+
+/* Read-modify-write just the 7-bit voltage selector (bits 6:0) of a PMIC register. */
+static int
+pwrap_rmw_sel(uint32_t reg, uint32_t sel)
+{
+	uint16_t old = 0;
+
+	if (!pwrap_read_ro(reg, &old)) {
+		return 0;
+	}
+	return pwrap_write16(reg, (uint16_t)((old & ~0x7fu) | (sel & 0x7fu)));
+}
+
+/* Log one MT6359P buck/LDO voltage: sel bits -> mV (bucks 400 + sel*625/100, LDOs 500 + ...). */
+static void
+pwrap_log_mv(const char * name, uint32_t reg, uint32_t sel_shift)
+{
+	uint16_t v = 0;
+
+	if (!pwrap_read_ro(reg, &v)) {
+		out(name); out(": PWRAP read failed\n");
+		return;
+	}
+	uint32_t sel = (v >> sel_shift) & 0x7fu;
+	uint32_t mv = (sel_shift == 0 ? 400u : 500u) + sel * 625u / 100u;
+
+	out(name); out(" raw="); out_hex(v); out(" sel="); out_dec(sel);
+	out(" = "); out_dec(mv); out(" mV\n");
+}
+
+static void
+mt6833_rails_probe(void)
+{
+	out("MT6833 PMIC rails (read-only):\n");
+	pwrap_log_mv("vproc1       (0x1726)", 0x1726, 0);
+	pwrap_log_mv("vsram_proc1  (0x1e90)", 0x1e90, 8);
+	pwrap_log_mv("vproc2       (0x17a6)", 0x17a6, 0);
+	pwrap_log_mv("vsram_proc2  (0x1eb0)", 0x1eb0, 8);
+	pwrap_log_mv("vgpu11       (0x15a6)", 0x15a6, 0);
+}
+
+/*
+ * Raise the A76 BIG-core rails to MT6833 stock OPP #4 (1993 MHz: Vproc 918.75 mV,
+ * Vsram 1018.75 mV). On MT6833 the A76 pair is buck_vgpu11 (vsel 0x15b4, readback 0x15a6)
+ * and ldo_vsram_proc1 (vsel 0x1b44, readback 0x1e90) -- verified from /sys/class/regulator.
+ * Step Vsram before Vproc at each stage, keeping (Vsram - Vproc) = 100 mV throughout.
+ * Returns 1 only if readback confirms both sels >= 82 (the safety gate for the PLL bump).
+ */
+#define VGPU11_VSEL     0x15b4u
+#define VSRAM_PROC1_VSEL 0x1b44u
+#define VGPU11_READBACK 0x15a6u
+#define VSRAM_P1_READBACK 0x1e90u
+
+static int
+a76_rails_to_opp4(void)
+{
+	static const uint32_t steps[][2] = {
+		{ 56u, 56u },   /* step 1: Vsram 850 mV, then Vproc 750 mV */
+		{ 72u, 72u },   /* step 2: Vsram 950 mV, then Vproc 850 mV */
+		{ 83u, 83u },   /* step 3: Vsram 1018.75 mV, then Vproc 918.75 mV */
+	};
+	uint16_t vproc = 0, vsram = 0;
+
+	for (uint32_t i = 0; i < 3; i++) {
+		if (!pwrap_rmw_sel(VSRAM_PROC1_VSEL, steps[i][0])) {
+			out("a76 rails: Vsram write failed\n");
+			return 0;
+		}
+		dbg_delay_us(50);
+		if (!pwrap_rmw_sel(VGPU11_VSEL, steps[i][1])) {
+			out("a76 rails: Vproc write failed\n");
+			return 0;
+		}
+		dbg_delay_us(i == 2 ? 100 : 50);
+	}
+	/* Mandatory safety gate: read back BOTH da_vsel registers. */
+	if (!pwrap_read_ro(VGPU11_READBACK, &vproc) || !pwrap_read_ro(VSRAM_P1_READBACK, &vsram)) {
+		out("a76 rails: readback failed\n");
+		return 0;
+	}
+	out("a76 rails readback: vgpu11 sel="); out_dec(vproc & 0x7fu);
+	out(" mV="); out_dec((uint32_t)(400u + (vproc & 0x7fu) * 625u / 100u));
+	out(", vsram_proc1 sel="); out_dec((vsram >> 8) & 0x7fu);
+	out(" mV="); out_dec((uint32_t)(500u + ((vsram >> 8) & 0x7fu) * 625u / 100u));
+	out("\n");
+	if ((vproc & 0x7fu) >= 82u && ((vsram >> 8) & 0x7fu) >= 82u) {
+		out("a76 rails: gate PASS (both sel >= 82)\n");
+		return 1;
+	}
+	out("a76 rails: gate FAIL — falling back to safe 1418 MHz\n");
+	return 0;
+}
 
 static void big_cores_clock(void)
 {
-	uint32_t before = rd32(APMIXED_BASE + ARMPLL_CON1), post = (before >> 24) & 7u;
-	uint32_t pcw = (uint32_t)(((uint64_t)BIG_MHZ << post) * 16384u / 26u);
+	uint32_t ll0 = rd32(APMIXED_BASE + ARMPLL_LL_CON0), ll1 = rd32(APMIXED_BASE + ARMPLL_LL_CON1);
+	uint32_t bl0 = rd32(APMIXED_BASE + ARMPLL_BL0_CON0), bl1 = rd32(APMIXED_BASE + ARMPLL_BL0_CON1);
+	uint32_t cc0 = rd32(APMIXED_BASE + CCIPLL_CON0), cc1 = rd32(APMIXED_BASE + CCIPLL_CON1);
 
-	if (post != 1 || (before & 0x3fffffu) >= pcw) {
-		return;                         /* not what LK is known to leave: leave it alone */
+	/* Log raw CON0/CON1 and computed MHz for all three PLLs BEFORE any change. */
+	out("cpu plls before: armpll_ll CON0="); out_hex(ll0); out(" CON1="); out_hex(ll1);
+	out(" ("); out_dec(pll_mhz(ll1)); out(" MHz)\n");
+	out("cpu plls before: armpll_bl0 CON0="); out_hex(bl0); out(" CON1="); out_hex(bl1);
+	out(" ("); out_dec(pll_mhz(bl1)); out(" MHz)\n");
+	out("cpu plls before: ccipll CON0="); out_hex(cc0); out(" CON1="); out_hex(cc1);
+	out(" ("); out_dec(pll_mhz(cc1)); out(" MHz)\n");
+
+	/* Raise the A76 BIG rails to OPP #4 and gate the PLL on the readback. */
+	if (a76_rails_to_opp4()) {
+		/* 1993 MHz: posdiv=0, PCW 0x1329d8 -> CON1 0x801329d8. */
+		wr32(APMIXED_BASE + ARMPLL_BL0_CON1, 0x801329d8u);
+		out("big cores (A76): ");
+		out_dec(pll_mhz(bl1));
+		out(" -> ");
+		out_dec(pll_mhz(rd32(APMIXED_BASE + ARMPLL_BL0_CON1)));
+		out(" MHz (OPP4, CON1=");
+		out_hex(rd32(APMIXED_BASE + ARMPLL_BL0_CON1));
+		out(")\n");
+	} else {
+		/* Safe fallback: keep the 1418 MHz setting from B5. */
+		wr32(APMIXED_BASE + ARMPLL_BL0_CON1, (1u << 31) | (BIG_POST << 24) | (uint32_t)BIG_PCW);
+		out("big cores (A76): ");
+		out_dec(pll_mhz(bl1));
+		out(" -> ");
+		out_dec(pll_mhz(rd32(APMIXED_BASE + ARMPLL_BL0_CON1)));
+		out(" MHz (safe 1418 fallback, CON1=");
+		out_hex(rd32(APMIXED_BASE + ARMPLL_BL0_CON1));
+		out(")\n");
 	}
-	wr32(APMIXED_BASE + ARMPLL_CON1, (1u << 31) | (post << 24) | pcw);
-	__asm__ volatile("dsb sy");
-	dbg_delay_us(20);
-	out("big cores: ");
-	out_dec((uint32_t)(((26ull * (before & 0x3fffffu)) >> 14) >> post));
+	__asm__ volatile("dsb sy\n" ::: "memory");
+	dbg_delay_us(50);
+
+	/* Raise the A55 LITTLE PLL (0x20c) 1811 -> 2000 MHz: posdiv=0, CON1 0x80133b13.
+	 * No PMIC write: vproc2 is already 1000 mV (stock OPP0 950 mV), posdiv stays 0. */
+	wr32(APMIXED_BASE + ARMPLL_LL_CON1, 0x80133b13u);
+	__asm__ volatile("dsb sy\n" ::: "memory");
+	dbg_delay_us(50);
+	out("little cores (A55): ");
+	out_dec(pll_mhz(ll1));
 	out(" -> ");
-	out_dec((uint32_t)(((26ull * (rd32(APMIXED_BASE + ARMPLL_CON1) & 0x3fffffu)) >> 14) >> post));
-	out(" MHz at the same 800 mV\n");
+	out_dec(pll_mhz(rd32(APMIXED_BASE + ARMPLL_LL_CON1)));
+	out(" MHz (CON1=");
+	out_hex(rd32(APMIXED_BASE + ARMPLL_LL_CON1));
+	out(")\n");
+
+	/* CCI (bus) PLL left at LK stock (674 MHz): B6/B7 measured that raising it to
+	 * 1210 MHz regressed smoothness on this board, so it is intentionally untouched.
+	 * The "ccipll before" line above already logs its stock value. */
+
+	/* Read-only rail voltages after the clock changes (no PMIC writes). */
+	mt6833_rails_probe();
 }
 
 static void __attribute__((noreturn)) run_xnu(void)
