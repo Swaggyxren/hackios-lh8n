@@ -18,12 +18,12 @@ The kernel, its MediaTek drivers, the `mtkloader` bootloader, and the staging to
 |---|---|---|
 | Boot chain | working | Android boot header v4; `mtkloader` chained in `boot_a`, XNU payload staged in `vendor_boot_a` |
 | Homescreen / shell | working | Graphical iOS 16.5 SpringBoard, wallpaper, dock and icons, resident (`loader_return_after=0`, graphics mode) |
-| Display | working | 1080 × 2460 @ 120 Hz, OVL0 hardware scanout at `0x76950000` |
-| CPU | working | All 8 cores |
+| Display | working | 1080 × 2460 @ 120 Hz (`fb_hz=120 fb_filter=0`, CoreAnimation 120 Hz pacing via LaunchDaemon env vars) |
+| CPU | working | All 8 cores — 2× Cortex-A76 @ 1993 MHz (stock OPP #4 via MT6833 v2 PWRAP) + 6× Cortex-A55 @ 2000 MHz |
 | Storage / root | working | Native UFS 2.2 handover; APFS root on `ufs_xnusys` mounted read-only |
 | Touch / input | working | FT8726 over SPI4; boot-ROM firmware download, then live `DOWN`/`UP` events reach SpringBoard |
 | Buttons | in progress | Power and volume keys via MT6833 GPIO/PMIC |
-| GPU | staged | Mali-G57 MC2 through `HakiosMali` (`mali=1`) |
+| GPU | working | Hardware Mali-G57 MC2 @ 1000 MHz (`MFGPLL`, `HakiosPanfrostGPU` + Mesa 25.0.7 Panfrost, WC BOs, fast job poll, 0 faults) |
 | Sensors | staged | Accelerometer via the SCP sensor hub |
 | Wi-Fi / BT | staged | CONNSYS initialization |
 | Apple services | no | Not a goal |
@@ -120,4 +120,8 @@ HakiOS is an independent research project. It is **not affiliated with or endors
 
 ## Credits
 
-See the upstream project for the full list of contributors. Special thanks to sicilium for the sources.
+- **[`oosexgang/hakios-xnu-kernel`](https://github.com/oosexgang/hakios-xnu-kernel)** — upstream HakiOS XNU kernel, `mtkloader`, `MiniIOMobileFramebuffer`, and MediaTek bring-up framework.
+- **[`Luminous418/hakios-a32`](https://github.com/Luminous418/hakios-a32)** — Mesa 25.0.7 Panfrost Darwin patchset (`panfrost-darwin.patch`), `hakios.drm.c` Panfrost DRM shim, and Panfrost userland GL integration.
+- **[`open-mapple`](https://github.com/open-mapple)** (`@DrtSinX98` / Pritish Joshi) & **[`Nik300/viva-gpu`](https://github.com/Nik300/viva-gpu)** — Mali-G57 hardware bring-up reference (stack power-on sequence, Valhall AArch64 MMU/PTE validation, and GPU architecture references).
+- **ryanistar — [`Xia-s-Projekt/hakios-x6739`](https://github.com/Xia-s-Projekt/hakios-x6739)** (`X6739` / MT6893 HakiOS port) — CoreAnimation 120 Hz environment variable set and frame-pacing diagnostics.
+- Special thanks to **sicilium** for the sources and all upstream HakiOS contributors.
