@@ -273,6 +273,22 @@ for label in labels:
     job.pop('_LimitLoadToDeviceTree', None)
     if 'all' in oslog or label in oslog:
         job.setdefault('EnvironmentVariables', {})['OS_ACTIVITY_DT_MODE'] = 'YES'
+    if label == 'com.apple.backboardd':
+        job.setdefault('EnvironmentVariables', {}).update({
+            'CA_FORCE_TIMER': '1',
+            'CA_FORCE_120HZ': '1',
+            'CA_HEARTBEAT_RATE': '120',
+            'CA_MINIMUM_FRAME_DURATION': '0.0083333',
+            'CA_DISABLE_APT': '1',
+            'CA_ENABLE_ALL_FRAME_RATES': '1',
+            'CA_ENABLE_HIGH_FRAME_RATE_RESTRICTION': '0',
+            'CA_ENABLE_REDUCED_SERVER_VSYNC_RENDER': '0',
+            'CADisableMinimumFrameDurationOnPhone': '1',
+        })
+    elif label == 'com.apple.SpringBoard':
+        job.setdefault('EnvironmentVariables', {}).update({
+            'CADisableMinimumFrameDurationOnPhone': '1',
+        })
     with open(f'{dest}/{label}.plist', 'wb') as f:
         plistlib.dump(job, f, fmt=plistlib.FMT_BINARY)
     program = job.get('Program') or job['ProgramArguments'][0]
