@@ -116,6 +116,54 @@ static uintptr_t (*orig_render_update)(void *server, void *update, unsigned *fla
 static unsigned calls_ready, calls_ignore, calls_begin, calls_finish, calls_render;
 static int last_ready = -1, last_ignore = -1;
 
+/*
+ * The constructor runs before kern.bootargs is readable from a program, so reading the ca_vbl /
+ * caenv switches there finds nothing (the X6739 port hit this too). Read them on the first frame
+ * decision instead, while CoreAnimation is still setting its clock up.
+ */
+static int ca_bootargs_done;
+
+static void
+apply_ca_bootargs(void)
+{
+	char arguments[1024] = "";
+	size_t size = sizeof(arguments) - 1;
+
+	if (ca_bootargs_done || sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) != 0)
+		return;
+	ca_bootargs_done = 1;
+
+	/*
+	 * Boot-arg ca_vbl=1: CoreAnimation's frame clock from the display driver's refresh
+	 * notifications. QuartzCore takes them (IOMobileFramebufferEnableVSyncNotifications) only on
+	 * the phones with an A7 to A10, or when CA_FORCE_TIMER is in the environment (CADeviceUseVBL()).
+	 */
+	if (strstr(arguments, "ca_vbl=1") != NULL) {
+		setenv("CA_FORCE_TIMER", "1", 1);
+		say("hakios: ca_vbl=1: CoreAnimation is to take the display driver's refresh notifications\n");
+	}
+	/*
+	 * Boot-arg caenv=NAME=VALUE (as many as wanted): into the window server's environment, for
+	 * CoreAnimation's own switches (CA_FORCE_120HZ=1, CA_HEARTBEAT_RATE=120 ...).
+	 */
+	for (const char *argument = arguments; (argument = strstr(argument, "caenv=")) != NULL; argument += 6) {
+		char setting[128];
+		size_t length = strcspn(argument + 6, " ");
+		char *equals;
+
+		if ((argument != arguments && argument[-1] != ' ') || length == 0 || length >= sizeof(setting)) {
+			continue;
+		}
+		memcpy(setting, argument + 6, length);
+		setting[length] = 0;
+		if ((equals = strchr(setting, '=')) != NULL) {
+			*equals = 0;
+			setenv(setting, equals + 1, 1);
+			say("hakios: caenv: %s=%s for the window server\n", setting, equals + 1);
+		}
+	}
+}
+
 static int
 my_is_ready(void *display)
 {
@@ -133,6 +181,7 @@ my_is_ready(void *display)
 static int
 my_ignore_update_p(void *display, void *update)
 {
+	apply_ca_bootargs();
 	int ignore = orig_ignore_update_p(display, update) & 1;
 
 	if (ignore != last_ignore || calls_ignore < 3) {
@@ -1090,40 +1139,8 @@ hakios_init(void)
 	}
 	slide = (uintptr_t)cache - CACHE_BASE;
 	if (strcmp(name, "backboardd") == 0) {
-		char arguments[1024] = "";
-		size_t size = sizeof(arguments) - 1;
-
-		/*
-		 * Boot-arg ca_vbl=1: CoreAnimation's frame clock from the display driver's refresh
-		 * notifications. QuartzCore takes them (IOMobileFramebufferEnableVSyncNotifications) only on
-		 * the phones with an A7 to A10, or when CA_FORCE_TIMER is in the environment
-		 * (CADeviceUseVBL()); on the iPhone X it runs a timer of its own instead (CADisplayTimer),
-		 * whose phase it would set from the frame timings of a display driver this one is not.
-		 */
-		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 && strstr(arguments, "ca_vbl=1") != NULL) {
-			setenv("CA_FORCE_TIMER", "1", 1);
-			say("hakios: ca_vbl=1: CoreAnimation is to take the display driver's refresh notifications\n");
-		}
-		/*
-		 * Boot-arg caenv=NAME=VALUE (as many as wanted): into the window server's environment, for
-		 * CoreAnimation's own switches (CA_LOG_TRIPLE_BUFFERING=1, CA_FORCE_DOUBLE_BUFFERING=1 ...).
-		 */
-		for (const char *argument = arguments; (argument = strstr(argument, "caenv=")) != NULL; argument += 6) {
-			char setting[128];
-			size_t length = strcspn(argument + 6, " ");
-			char *equals;
-
-			if ((argument != arguments && argument[-1] != ' ') || length == 0 || length >= sizeof(setting)) {
-				continue;
-			}
-			memcpy(setting, argument + 6, length);
-			setting[length] = 0;
-			if ((equals = strchr(setting, '=')) != NULL) {
-				*equals = 0;
-				setenv(setting, equals + 1, 1);
-				say("hakios: caenv: %s=%s for the window server\n", setting, equals + 1);
-			}
-		}
+		/* ca_vbl / caenv are read on the first ignore_update_p call, not here: bootargs is not
+		 * readable from a program while constructors run. */
 		opengl_es();
 		window_server_fixes();
 		/*

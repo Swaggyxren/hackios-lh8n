@@ -16,9 +16,13 @@
 
 #include "xf86drm.h"
 
-#define HAKIOS_GPU_SERVICE     "HakiosGPU"
-#define HAKIOS_GPU_SURFACE     0x7e            /* the request that is not Linux's */
-#define HAKIOS_GPU_DESCRIBE    0xffffffffu     /* ... asked only what the buffer would be like */
+#define HAKIOS_GPU_SERVICE     "HakiosGPU"     /* the Adreno (iokit/Kernel/hakios.gpu.cpp) */
+#define HAKIOS_MALI_SERVICE    "HakiosPanfrostGPU"   /* the Mali (iokit/Kernel/hakios.mali.cpp) */
+#define HAKIOS_SURFACE         0x7e            /* the request that is not Linux's */
+#define HAKIOS_DESCRIBE        0xffffffffu     /* ... asked only what the buffer would be like */
+#define HAKIOS_WAIT            0x7d            /* a job's number, waited for */
+
+static int is_panfrost;
 
 static io_connect_t connection;
 static int connection_fd = -1;
@@ -30,13 +34,18 @@ drmOpenWithType(const char *name, const char *busid, int type)
 
 	(void)busid;
 	(void)type;
-	if (strcmp(name, "msm") != 0) {
+	if (strcmp(name, "msm") == 0) {
+		is_panfrost = 0;
+	} else if (strcmp(name, "panfrost") == 0) {
+		is_panfrost = 1;
+	} else {
 		return -1;
 	}
 	if (connection_fd >= 0) {
 		return dup(connection_fd);
 	}
-	service = IOServiceGetMatchingService(0, IOServiceMatching(HAKIOS_GPU_SERVICE));
+	service = IOServiceGetMatchingService(0,
+	    IOServiceMatching(is_panfrost ? HAKIOS_MALI_SERVICE : HAKIOS_GPU_SERVICE));
 	if (service == 0) {
 		return -1;
 	}
@@ -75,16 +84,28 @@ call(unsigned number, void *data, size_t size)
 	}
 }
 
+struct hakios_wait {
+	uint64_t seq;
+	int64_t timeout_ns;
+};
+
 int
 drmIoctl(int fd, unsigned long request, void *arg)
 {
-	int error = call((unsigned)(request & 0xff), arg, IOCPARM_LEN(request));
+	unsigned number = (unsigned)(request & 0xff);
+	int error = call(number, arg, IOCPARM_LEN(request));
 
 	(void)fd;
 	if (error != 0) {
 		errno = error;
 		return -1;
 	}
+	/*
+	 * The Mali service queues a job chain and hands its number back in submit.jc. Every job
+	 * must be over before the call returns here, so the syncobjs a driver waits on can all be
+	 * said to be signalled (see below). The Adreno service runs its jobs before returning.
+	 */
+	/* our driver is synchronous; no HAKIOS_WAIT */
 	return 0;
 }
 
@@ -114,11 +135,11 @@ drmGetVersion(int fd)
 	(void)fd;
 	if (version != NULL) {
 		version->version_major = 1;
-		version->version_minor = 7;
-		version->name = strdup("msm");
-		version->name_len = 3;
+		version->version_minor = is_panfrost ? 1 : 7;
+		version->name = strdup(is_panfrost ? "panfrost" : "msm");
+		version->name_len = (int)strlen(version->name);
 		version->date = strdup("");
-		version->desc = strdup("Adreno on Darwin");
+		version->desc = strdup(is_panfrost ? "Mali on Darwin" : "Adreno on Darwin");
 		version->desc_len = (int)strlen(version->desc);
 	}
 	return version;
@@ -133,6 +154,14 @@ drmFreeVersion(drmVersionPtr version)
 		free(version->desc);
 		free(version);
 	}
+}
+
+int
+drmCloseBufferHandle(int fd, uint32_t handle)
+{
+	struct drm_gem_close close = { .handle = handle };
+
+	return drmIoctl(fd, DRM_IOCTL_GEM_CLOSE, &close);
 }
 
 int
@@ -176,8 +205,8 @@ hakios_drm_surface(int fd, struct hakios_drm_surface *surface)
 	int error;
 
 	(void)fd;
-	surface->handle = HAKIOS_GPU_DESCRIBE;
-	error = call(HAKIOS_GPU_SURFACE, surface, sizeof(*surface));
+	surface->handle = HAKIOS_DESCRIBE;
+	error = call(HAKIOS_SURFACE, surface, sizeof(*surface));
 	if (error != 0) {
 		errno = error;
 		return -1;
@@ -189,7 +218,7 @@ int
 drmPrimeFDToHandle(int fd, int surface, uint32_t *handle)
 {
 	struct hakios_drm_surface request = { .surface = (uint32_t)surface };
-	int error = call(HAKIOS_GPU_SURFACE, &request, sizeof(request));
+	int error = call(HAKIOS_SURFACE, &request, sizeof(request));
 
 	(void)fd;
 	if (error != 0) {
@@ -211,16 +240,73 @@ none(void)
 #define NONE(name, ...) int name(__VA_ARGS__) { return none(); }
 NONE(drmPrimeHandleToFD, __attribute__((unused)) int fd, __attribute__((unused)) uint32_t handle,
     __attribute__((unused)) uint32_t flags, __attribute__((unused)) int *prime_fd)
-NONE(drmSyncobjCreate, __attribute__((unused)) int fd, __attribute__((unused)) uint32_t flags,
-    __attribute__((unused)) uint32_t *handle)
-NONE(drmSyncobjDestroy, __attribute__((unused)) int fd, __attribute__((unused)) uint32_t handle)
-NONE(drmSyncobjReset, __attribute__((unused)) int fd, __attribute__((unused)) const uint32_t *handles,
-    __attribute__((unused)) uint32_t count)
-NONE(drmSyncobjFDToHandle, __attribute__((unused)) int fd, __attribute__((unused)) int obj_fd,
-    __attribute__((unused)) uint32_t *handle)
-NONE(drmSyncobjHandleToFD, __attribute__((unused)) int fd, __attribute__((unused)) uint32_t handle,
-    __attribute__((unused)) int *obj_fd)
-NONE(drmSyncobjImportSyncFile, __attribute__((unused)) int fd, __attribute__((unused)) uint32_t handle,
-    __attribute__((unused)) int sync_file_fd)
-NONE(drmSyncobjExportSyncFile, __attribute__((unused)) int fd, __attribute__((unused)) uint32_t handle,
-    __attribute__((unused)) int *sync_file_fd)
+/*
+ * Fences are the one thing this driver's jobs do not need: a job is over before SUBMIT returns
+ * (see drmIoctl). So every syncobj is created already signalled, waits answer at once, and a
+ * sync file is a descriptor to /dev/null: what a consumer waits on is already done.
+ */
+static uint32_t next_syncobj = 1;
+
+int
+drmSyncobjCreate(int fd, uint32_t flags, uint32_t *handle)
+{
+	(void)fd; (void)flags;
+	*handle = next_syncobj++;
+	return 0;
+}
+int
+drmSyncobjDestroy(int fd, uint32_t handle) { (void)fd; (void)handle; return 0; }
+int
+drmSyncobjReset(int fd, const uint32_t *handles, uint32_t count) { (void)fd; (void)handles; (void)count; return 0; }
+int
+drmSyncobjFDToHandle(int fd, int obj_fd, uint32_t *handle)
+{
+	(void)fd; (void)obj_fd;
+	*handle = next_syncobj++;
+	return 0;
+}
+int
+drmSyncobjHandleToFD(int fd, uint32_t handle, int *obj_fd)
+{
+	(void)fd; (void)handle;
+	*obj_fd = open("/dev/null", O_RDONLY);
+	return *obj_fd < 0 ? -1 : 0;
+}
+int
+drmSyncobjImportSyncFile(int fd, uint32_t handle, int sync_file_fd)
+{
+	(void)fd; (void)handle; (void)sync_file_fd;
+	return 0;
+}
+int
+drmSyncobjExportSyncFile(int fd, uint32_t handle, int *sync_file_fd)
+{
+	(void)fd; (void)handle;
+	*sync_file_fd = open("/dev/null", O_RDONLY);
+	return *sync_file_fd < 0 ? -1 : 0;
+}
+int
+drmSyncobjWait(int fd, const uint32_t *handles, uint32_t count, int64_t timeout_nsec,
+    uint32_t flags, uint32_t *first_signaled)
+{
+	(void)fd; (void)timeout_nsec; (void)flags;
+	if (first_signaled != NULL && count > 0)
+		*first_signaled = handles[0];
+	return 0;
+}
+int
+drmSyncobjTransfer(int fd, uint32_t dst_handle, uint64_t dst_point, uint32_t src_handle,
+    uint64_t src_point, uint32_t flags)
+{
+	(void)fd; (void)dst_handle; (void)dst_point; (void)src_handle; (void)src_point; (void)flags;
+	return 0;
+}
+int
+drmSyncobjTimelineWait(int fd, const uint32_t *handles, const uint64_t *points,
+    uint32_t count, int64_t timeout_nsec, uint32_t flags, uint32_t *first_signaled)
+{
+	(void)fd; (void)points; (void)timeout_nsec; (void)flags;
+	if (first_signaled != NULL && count > 0)
+		*first_signaled = handles[0];
+	return 0;
+}
