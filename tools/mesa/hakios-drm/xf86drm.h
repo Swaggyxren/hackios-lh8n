@@ -79,5 +79,7 @@ struct hakios_drm_surface {
 	uint32_t width, height, pixel_format, planes;   /* and what they are */
 };
 int hakios_drm_surface(int fd, struct hakios_drm_surface *surface);
+int hakios_drm_submit_pair(int fd, uint64_t vtc_jc, uint64_t frag_jc, uint32_t requirements,
+    uint32_t out_sync, const uint32_t *bo_handles, uint32_t bo_handle_count);
 
 #endif

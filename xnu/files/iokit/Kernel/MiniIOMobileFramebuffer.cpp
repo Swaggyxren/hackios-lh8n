@@ -30,6 +30,7 @@
 #include <libkern/c++/OSString.h>
 #include <sys/systm.h>
 #include <sys/proc.h>
+#include <sys/sysctl.h>
 
 extern "C" {
 #include <console/video_console.h>
@@ -212,13 +213,33 @@ static TUNABLE(uint32_t, gFlicker, "fb_flicker", 0);
  */
 static TUNABLE(uint32_t, gFilter, "fb_filter", 1);
 static TUNABLE(uint32_t, gRefreshHz, "fb_hz", kFBRefreshHz);
+static TUNABLE(uint32_t, gCARefreshHz, "fb_ca_hz", 0);
 static TUNABLE(uint32_t, gOnTheBeat, "fb_beat", 1);
+/* kern.hakios.fb_surface: the IOSurface on the panel, for a picture of what is there (SpringBoard's wallpaper_freeze=1) */
+SYSCTL_DECL(_kern_hakios);
+static uint32_t gShownSurface;
+SYSCTL_UINT(_kern_hakios, OID_AUTO, fb_surface, CTLFLAG_RD | CTLFLAG_LOCKED, &gShownSurface, 0, "the IOSurface last put on the panel");
 /*
  * Boot-arg fb_threads=N (1 to 8): so many processors scale a frame onto the panel together (see
  * drawRows()). Three by default: a frame is in the panel's memory 3 ms after its turn instead of 9
  * to 10 (the phone, 15 October; fb_threads=1 is how it was).
  */
 static TUNABLE(uint32_t, gThreads, "fb_threads", 3);
+/*
+ * Boot-arg fb_pri=N: scheduling priority for the presenter and worker threads (default 92, BASEPRI_PREEMPT).
+ */
+static TUNABLE(uint32_t, gThreadPriority, "fb_pri", 92);
+extern "C" kern_return_t kernel_thread_start_priority(thread_continue_t continuation, void * parameter, integer_t priority,
+    thread_t * new_thread);
+
+static kern_return_t
+panel_thread_start(thread_continue_t continuation, void * parameter, thread_t * thread)
+{
+	if (gThreadPriority >= 1 && gThreadPriority <= 95) {
+		return kernel_thread_start_priority(continuation, parameter, (integer_t) gThreadPriority, thread);
+	}
+	return kernel_thread_start(continuation, parameter, thread);
+}
 /*
  * Three since 26 October: a swap comes in as soon as its command buffer is committed, before the GPU
  * has begun it, and waits here some 8 ms for the GPU and then for its beat -- 20 ms a frame. With two
@@ -324,6 +345,9 @@ swapWord(const uint8_t * swap, unsigned offset)
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
 struct RowJob;
+struct ColRun {
+	uint32_t        dstX, srcX, len;
+};
 
 class IOMobileFramebuffer : public IOService
 {
@@ -332,14 +356,27 @@ class IOMobileFramebuffer : public IOService
 public:
 	IOLock *        fLock;
 	uint8_t *       fBase;                  /* the boot framebuffer: the panel */
-	/* boot-arg fb_flip=1: two of the boot framebuffer's pictures, drawn in turn, the panel's
+	/* boot-arg fb_flip=1: up to three of the boot framebuffer's pictures, drawn in turn, the panel's
 	 * scanout (OVL0 layer 0) pointed at the finished one -- see flipStart() */
 	bool            fFlip;
-	unsigned        fFront;                 /* which of the two the panel shows */
-	uint8_t *       fFlipVA[2];             /* each, where the frame drawn into it starts */
-	uint32_t        fFlipPA[2];             /* each, the address OVL0 is given */
+	unsigned        fFront;                 /* which of them was last handed to OVL0 */
+	unsigned        fFlipCount;             /* 2 or 3 buffered panel pictures */
+	unsigned        fFlipsSinceVsync;       /* flips posted since RDMA last signaled FRAME_START */
+	uint8_t *       fFlipVA[3];             /* each, where the frame drawn into it starts */
+	uint32_t        fFlipPA[3];             /* each, the address OVL0 is given */
 	volatile uint32_t * fOvl;
+	volatile uint32_t * fRdma;
+	uint32_t        fOvlConSaved;
+	bool            fOvlDirect;
+	MiniIOSurface * fHeldSurface[2];
+	uint32_t        fHeldNext, fScanCount, fBlitCount;
+	uint32_t        fLastScanW, fLastScanH, fLastScanPitch, fLastScanOff;
+	uint32_t        fVsyncOk, fVsyncTmo, fRdmaUnderflow;
+	uint64_t        fVsyncWaitNs;
 	void flipStart(void);
+	void restoreOvlDefault(void);
+	bool waitVSync(void);
+	bool tryDirectScanout(const uint8_t * swap, MiniIOSurface ** surfaces);
 	uint32_t        fPanelWidth, fPanelHeight, fRowBytes;
 	uint32_t        fFillWidth, fCropX;         /* fbfit=2: the picture's width on the panel, and how much of it is cut off at each side */
 	uint32_t        fWidth, fHeight;        /* the display as user space sees it */
@@ -397,6 +434,7 @@ public:
 	/* the screen recording, if one was asked for */
 	uint32_t *      fColumn;                /* drawLayer(): source column for every panel column */
 	uint16_t *      fColumnWeight;          /* ... with fb_filter: how much of the column after it, of 256 */
+	ColRun *        fColRuns;               /* ... without fb_filter: contiguous pixel spans for burst copy */
 	uint32_t *      fBlendRow;              /* ... and a row of the picture blended from two (fBlendRowSize pixels) */
 	uint32_t        fBlendRowSize;
 	uint8_t *       fRecBase;
@@ -409,21 +447,25 @@ public:
 
 	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
 	void publishModes(void);
+	void publishRefresh(void);
 	MiniIOSurface * defaultSurface(void);
 	void present(const uint8_t * swap);
 	void shot(MiniIOSurface * s);
 	uint32_t        fShotStats;
-	void show(const uint8_t * swap, MiniIOSurface ** surfaces);
+	void show(const uint8_t * swap, MiniIOSurface ** surfaces, bool redraw = false);
 	void presenter(void);
 	static void presenterMain(void * self, wait_result_t result);
 	void reportFrameTimes(void);
 	void drawLayer(MiniIOSurface * s, const int32_t * src, const int32_t * dst);
+	bool            fFilterStill;
 	void drawRows(const struct RowJob * job, int32_t y0, int32_t y1, uint32_t * blendRow);
+	void drawHelperChunks(const struct RowJob * job, uint32_t * blendRow);
 	static void helperMain(void * self, wait_result_t result);
 	/* the scaling shared out (fb_threads): fThreads drawers, the presenter and fThreads - 1 helpers */
 	unsigned        fThreads;
 	IOLock *        fHelperLock;
 	const struct RowJob * fHelperJob;
+	int32_t         fHelperNextRow;
 	uint64_t        fHelperGeneration;
 	unsigned        fHelpersBusy, fHelpersStarted;
 	uint32_t *      fHelperBlend[7];
@@ -451,6 +493,33 @@ setNumber(OSDictionary * dict, const char * key, uint64_t value)
  */
 #define kFBTimingID     1
 #define kFBColorID      1
+
+/*
+ * Upstream HakiOS IOMFBDisplayRefresh: CoreAnimation clocks frames from this property (without it,
+ * iOS treats the built-in panel as 60 Hz; and when told 120 Hz it draws at half rate unless told
+ * 240 Hz, so default told to 2x panel rate when fb_hz > 60).
+ */
+void
+IOMobileFramebuffer::publishRefresh(void)
+{
+	OSDictionary * refresh = OSDictionary::withCapacity(4);
+	uint32_t hz = refreshHz();
+	uint32_t told = (gCARefreshHz >= 1 && gCARefreshHz <= 480) ? gCARefreshHz : (hz > 60 ? hz * 2 : hz);
+	uint64_t interval = (1ULL << 32) / told, ticks;
+
+	if (refresh == NULL) {
+		return;
+	}
+	nanoseconds_to_absolutetime(NSEC_PER_SEC / told, &ticks);
+	setNumber(refresh, "displayMinRefreshInterval", interval);
+	setNumber(refresh, "displayMaxRefreshInterval", interval);
+	setNumber(refresh, "displayRefreshStep", interval);
+	setNumber(refresh, "displayRefreshStepMachTime", ticks);
+	setProperty("IOMFBDisplayRefresh", refresh);
+	refresh->release();
+	hakios_keep("MiniIOMobileFramebuffer: IOMFBDisplayRefresh: %u Hz (panel %u Hz), interval=%llu (2^-32 s), ticks=%llu",
+	    told, hz, interval, ticks);
+}
 
 void
 IOMobileFramebuffer::publishModes(void)
@@ -495,6 +564,7 @@ IOMobileFramebuffer::publishModes(void)
 
 	setProperty("TimingElements", timings);
 	setProperty("ColorElements", colors);
+	publishRefresh();
 	OSSafeReleaseNULL(timings);
 	OSSafeReleaseNULL(colors);
 	OSSafeReleaseNULL(timing);
@@ -513,7 +583,7 @@ IOMobileFramebuffer::publishModes(void)
  * it. Only when OVL0 reads where the console's framebuffer is and the second picture fits.
  */
 #if defined(HAKIOS_MT6833_UFS) || defined(HAKIOS_MT6833_KEYS) || defined(HAKIOS_MT6833_MALI)
-#define FLIP_OVL0               0x14005000ULL           /* MT6833: disp_ovl0@14005000 */
+#define FLIP_OVL0               0x14006000ULL           /* MT6833: disp_ovl0_2l@14006000 (active LK scanout) */
 #define FLIP_LK_FB_BASE         0x60000000ULL           /* MT6833 dynamic LK FB range */
 #define FLIP_LK_FB_SIZE         0x30000000ULL           /* 768 MB window */
 #else
@@ -521,10 +591,23 @@ IOMobileFramebuffer::publishModes(void)
 #define FLIP_LK_FB_BASE         0x787b0000ULL
 #define FLIP_LK_FB_SIZE         0x1050000ULL
 #endif
+#define FLIP_OVL_L0_CON         0x030
+#define FLIP_OVL_L0_SIZE        0x038
+#define FLIP_OVL_L0_OFF         0x03c
+#define FLIP_OVL_L0_PITCH       0x044
 #define FLIP_OVL_L0_ADDR        0xf40
+#define FLIP_RDMA_INT_EN        0x000
+#define FLIP_RDMA_INT_STA       0x004
+#define FLIP_RDMA_FRAME_START   0x002u
 extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
-extern "C" vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+extern "C" vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
+extern "C" void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
+#ifndef VM_WIMG_WCOMB
+#define VM_WIMG_WCOMB 0x6 /* osfmk/arm/memory_types.h: VM_MEM_NOT_CACHEABLE | VM_MEM_COHERENT */
+#endif
 static TUNABLE(uint32_t, gFlipOn, "fb_flip", 0);
+static TUNABLE(uint32_t, gZeroCopy, "fb_zerocopy", 0);
+static TUNABLE(uint32_t, gZeroCopyVsync, "fb_zc_vsync", 1);
 
 void
 IOMobileFramebuffer::flipStart(void)
@@ -536,7 +619,22 @@ IOMobileFramebuffer::flipStart(void)
 	if (!gFlipOn) {
 		return;
 	}
+#if defined(HAKIOS_MT6833_UFS) || defined(HAKIOS_MT6833_KEYS) || defined(HAKIOS_MT6833_MALI)
+	volatile uint32_t * disp = (volatile uint32_t *) ml_io_map(0x14000000ULL, 0x8000);
+	fOvl = disp != NULL ? disp + (0x6000 / 4) : NULL;
+	fRdma = disp != NULL ? disp + (0x7000 / 4) : NULL;
+	if (disp != NULL) {
+		IOLog("MiniIOMobileFramebuffer: fb_flip: ovl2l(en=%#x src=%#x l0=%#x pitch=%#x addr=%#x) "
+		    "mutex(en=%#x ctl=%#x) rdma_en=%#x rdma_sta=%#x\n",
+		    disp[(0x6000 + 0x00c) / 4], disp[(0x6000 + 0x02c) / 4],
+		    disp[(0x6000 + 0x030) / 4], disp[(0x6000 + 0x044) / 4] & 0xffffu,
+		    disp[(0x6000 + 0xf40) / 4],
+		    disp[0x1020 / 4], disp[0x102c / 4], disp[0x7000 / 4], disp[0x7004 / 4]);
+	}
+#else
 	fOvl = (volatile uint32_t *) ml_io_map(FLIP_OVL0, PAGE_SIZE);
+	fRdma = NULL;
+#endif
 	scanned = fOvl != NULL ? fOvl[FLIP_OVL_L0_ADDR / 4] : 0;
 	picture = (picture + PAGE_SIZE - 1) & ~(uint64_t) (PAGE_SIZE - 1);
 	if (scanned != (uint32_t) vinfo.v_physaddr || scanned < FLIP_LK_FB_BASE ||
@@ -545,7 +643,8 @@ IOMobileFramebuffer::flipStart(void)
 		    "not flipping\n", scanned, (unsigned long long) vinfo.v_physaddr);
 		return;
 	}
-	second = ml_io_map_wcomb(scanned + picture, (vm_size_t) picture);
+	/* Allocate in kernel_map rather than io_submap so 10+ MB panels do not hit KERN_NO_SPACE. */
+	second = ml_io_map_unmappable(scanned + picture, (vm_size_t) picture, VM_WIMG_WCOMB);
 	if (second == 0) {
 		IOLog("MiniIOMobileFramebuffer: fb_flip: the second picture could not be mapped\n");
 		return;
@@ -555,9 +654,179 @@ IOMobileFramebuffer::flipStart(void)
 	fFlipVA[1] = (uint8_t *) second + offset;
 	fFlipPA[0] = scanned;
 	fFlipPA[1] = (uint32_t) (scanned + picture);
+	fFlipCount = 2;
+#if defined(HAKIOS_MT6833_UFS) || defined(HAKIOS_MT6833_KEYS) || defined(HAKIOS_MT6833_MALI)
+	if (scanned == 0x76950000u && (uint64_t) scanned + 3 * picture <= 0x76950000ULL + 0x1eb0000ULL) {
+		vm_offset_t third = ml_io_map_unmappable(scanned + 2 * picture, (vm_size_t) picture, VM_WIMG_WCOMB);
+
+		if (third != 0) {
+			memcpy((void *) third, (const void *) vinfo.v_baseaddr, (size_t) picture);
+			fFlipVA[2] = (uint8_t *) third + offset;
+			fFlipPA[2] = (uint32_t) (scanned + 2 * picture);
+			fFlipCount = 3;
+		}
+	}
+#endif
 	fFront = 0;
+	fFlipsSinceVsync = 0;
+	if (fRdma != NULL) {
+		fRdma[FLIP_RDMA_INT_STA / 4] = 0;
+		__builtin_arm_dsb(0xf);
+	}
+	fOvlConSaved = fOvl[FLIP_OVL_L0_CON / 4];
+	fOvlDirect = false;
 	fFlip = true;
-	hakios_keep("MiniIOMobileFramebuffer: fb_flip: two pictures, at %#x and %#x", fFlipPA[0], fFlipPA[1]);
+	hakios_keep("MiniIOMobileFramebuffer: fb_flip: %u pictures (%#x, %#x, %#x; size=%#x off=%#x zerocopy=%u)",
+	    fFlipCount, fFlipPA[0], fFlipPA[1], fFlipCount > 2 ? fFlipPA[2] : 0,
+	    fOvl[FLIP_OVL_L0_SIZE / 4], fOvl[FLIP_OVL_L0_OFF / 4], gZeroCopy);
+}
+
+void
+IOMobileFramebuffer::restoreOvlDefault(void)
+{
+	if (!fOvlDirect || fOvl == NULL) {
+		return;
+	}
+	fOvl[FLIP_OVL_L0_CON / 4] = fOvlConSaved;
+	fOvl[FLIP_OVL_L0_SIZE / 4] = ((uint32_t) vinfo.v_height << 16) | vinfo.v_width;
+	fOvl[FLIP_OVL_L0_OFF / 4] = 0;
+	fOvl[FLIP_OVL_L0_PITCH / 4] = vinfo.v_rowbytes;
+	fOvlDirect = false;
+	fLastScanW = fLastScanH = fLastScanPitch = fLastScanOff = 0;
+}
+
+bool
+IOMobileFramebuffer::waitVSync(void)
+{
+	uint64_t began;
+	uint32_t seen;
+
+	if (!gZeroCopyVsync || fRdma == NULL) {
+		return true;
+	}
+	began = mach_absolute_time();
+	fRdma[FLIP_RDMA_INT_STA / 4] = 0;
+	__builtin_arm_dsb(0xf);
+	for (unsigned ms = 0; ms < 25; ms++) {
+		seen = fRdma[FLIP_RDMA_INT_STA / 4];
+		if ((seen & 0x18u) != 0) {
+			fRdmaUnderflow++;
+		}
+		if ((seen & FLIP_RDMA_FRAME_START) != 0) {
+			fRdma[FLIP_RDMA_INT_STA / 4] = 0;
+			fVsyncOk++;
+			fVsyncWaitNs += mach_absolute_time() - began;
+			return true;
+		}
+		IOSleep(1);
+	}
+	fVsyncTmo++;
+	fVsyncWaitNs += mach_absolute_time() - began;
+	if (fVsyncTmo == 1) {
+		hakios_keep("MiniIOMobileFramebuffer: waitVSync timeout (rdma_en=%#x sta=%#x ovl_sta=%#x)",
+		    fRdma[FLIP_RDMA_INT_EN / 4], fRdma[FLIP_RDMA_INT_STA / 4],
+		    fOvl ? fOvl[0x008 / 4] : 0);
+	}
+	return false;
+}
+
+bool
+IOMobileFramebuffer::tryDirectScanout(const uint8_t * swap, MiniIOSurface ** surfaces)
+{
+	MiniIOSurface * s = surfaces[0];
+	MiniIOSurface * prev;
+	MiniIOSurface * hold;
+	int32_t src[4], dst[4];
+	IOByteCount segLen = 0;
+	addr64_t phys;
+	uint32_t srcW, srcX, dstX, dstY, scanPA, offReg;
+	uint64_t totalBytes;
+
+	if (!gZeroCopy || !fFlip || fOvl == NULL || s == NULL) {
+		return false;
+	}
+	for (unsigned layer = 1; layer < SWAP_LAYERS; layer++) {
+		if (surfaces[layer] != NULL || swapWord(swap, SWAP_SURFACE(layer)) != 0) {
+			return false;
+		}
+	}
+	if (s->info.bytesPerElement != 4 || s->info.planeCount != 0 || s->memory == NULL || s->client != NULL) {
+		return false;
+	}
+	if (s->info.width == 0 || s->info.height == 0 || s->info.height > vinfo.v_height) {
+		return false;
+	}
+	memcpy(src, swap + SWAP_SOURCE(0), sizeof(src));
+	memcpy(dst, swap + SWAP_DEST(0), sizeof(dst));
+	if (src[2] > 0 && src[3] > 0 &&
+	    (src[0] != 0 || src[1] != 0 || (uint32_t) src[2] != s->info.width || (uint32_t) src[3] != s->info.height)) {
+		return false;
+	}
+	if (dst[2] > 0 && dst[3] > 0 &&
+	    (dst[0] != 0 || dst[1] != 0 || (uint32_t) dst[2] != fWidth || (uint32_t) dst[3] != fHeight)) {
+		return false;
+	}
+	if (s->info.width <= vinfo.v_width) {
+		srcW = s->info.width;
+		srcX = 0;
+		dstX = (vinfo.v_width - srcW) / 2;
+	} else {
+		srcW = vinfo.v_width;
+		srcX = ((s->info.width - vinfo.v_width) / 2) & ~15u;
+		dstX = 0;
+	}
+	if (s->info.bytesPerRow < srcW * 4 || (s->info.bytesPerRow & 3u) != 0) {
+		return false;
+	}
+	totalBytes = (uint64_t) s->info.offset + (uint64_t) s->info.bytesPerRow * s->info.height;
+	phys = s->memory->getPhysicalSegment(PAGE_SIZE, &segLen, kIOMemoryMapperNone);
+	if (phys == 0 || (uint64_t) segLen < totalBytes || phys + totalBytes > 0xffffffffULL) {
+		return false;
+	}
+	dstY = (vinfo.v_height - s->info.height) / 2;
+	scanPA = (uint32_t) (phys + s->info.offset + (uint64_t) srcX * 4);
+	offReg = ((uint32_t) dstY << 16) | dstX;
+	if (!fGraphics) {
+		fGraphics = true;
+		PE_initialize_console(NULL, kPEGraphicsMode);
+	}
+	prev = fHeldSurface[0];
+	hold = (prev != NULL && prev->sid == s->sid) ? prev : MiniIOSurfaceCopy(s->sid);
+	if (hold != prev) {
+		MiniIOSurfaceUse(hold, 1);
+	}
+	FlushPoC_DcacheRegion((vm_offset_t) (s->kpixels + s->info.offset), (size_t) s->info.bytesPerRow * s->info.height);
+	__builtin_arm_dsb(0xf);
+	if (!fOvlDirect || fLastScanW != srcW || fLastScanH != s->info.height ||
+	    fLastScanPitch != s->info.bytesPerRow || fLastScanOff != offReg) {
+		fOvl[FLIP_OVL_L0_CON / 4] = fOvlConSaved & ~0x100u;
+		fOvl[FLIP_OVL_L0_SIZE / 4] = ((uint32_t) s->info.height << 16) | srcW;
+		fOvl[FLIP_OVL_L0_OFF / 4] = offReg;
+		fOvl[FLIP_OVL_L0_PITCH / 4] = s->info.bytesPerRow;
+		fLastScanW = srcW;
+		fLastScanH = s->info.height;
+		fLastScanPitch = s->info.bytesPerRow;
+		fLastScanOff = offReg;
+	}
+	fOvl[FLIP_OVL_L0_ADDR / 4] = scanPA;
+	__builtin_arm_dsb(0xf);
+	fOvlDirect = true;
+	fHeldSurface[0] = hold;
+
+	waitVSync();
+	if (prev != NULL && prev != hold) {
+		MiniIOSurfaceUse(prev, -1);
+		MiniIOSurfaceDrop(prev);
+	}
+	fScanCount++;
+	if (fScanCount == 1) {
+		hakios_keep("MiniIOMobileFramebuffer: zero-copy scanout #1 surf=%u %ux%u fmt='%c%c%c%c' pa=%#x pitch=%u off=%u,%u",
+		    s->sid, srcW, s->info.height,
+		    (int) ((s->info.pixelFormat >> 24) & 0xff), (int) ((s->info.pixelFormat >> 16) & 0xff),
+		    (int) ((s->info.pixelFormat >> 8) & 0xff), (int) (s->info.pixelFormat & 0xff),
+		    scanPA, s->info.bytesPerRow, dstX, dstY);
+	}
+	return true;
 }
 
 bool
@@ -578,7 +847,7 @@ IOMobileFramebuffer::start(IOService * provider)
 	}
 	fLock = IOLockAlloc();
 	fSwapLock = IOLockAlloc();
-	if (kernel_thread_start(&IOMobileFramebuffer::presenterMain, this, &thread) != KERN_SUCCESS) {
+	if (panel_thread_start(&IOMobileFramebuffer::presenterMain, this, &thread) != KERN_SUCCESS) {
 		IOLog("MiniIOMobileFramebuffer: no thread to put frames on the panel with\n");
 		return false;
 	}
@@ -587,7 +856,7 @@ IOMobileFramebuffer::start(IOService * provider)
 	fThreads = gThreads >= 1 && gThreads <= 8 ? gThreads : 1;
 	fHelperLock = IOLockAlloc();
 	for (unsigned i = 0; i + 1 < fThreads; i++) {
-		if (kernel_thread_start(&IOMobileFramebuffer::helperMain, this, &thread) != KERN_SUCCESS) {
+		if (panel_thread_start(&IOMobileFramebuffer::helperMain, this, &thread) != KERN_SUCCESS) {
 			fThreads = i + 1;
 			break;
 		}
@@ -666,6 +935,7 @@ IOMobileFramebuffer::start(IOService * provider)
 	flipStart();
 	fColumn = IONewZero(uint32_t, fPanelWidth);
 	fColumnWeight = IONewZero(uint16_t, fPanelWidth);
+	fColRuns = IONewZero(ColRun, fPanelWidth);
 	fDiff = gDiff != 0;
 	fDiffLeft = fDiffTop = ~0u;
 	IOLog("MiniIOMobileFramebuffer: display %ux%u on a panel of %ux%u (%u bytes per row)\n", fWidth, fHeight,
@@ -850,6 +1120,8 @@ struct RowJob {
 	uint32_t        stride;
 	int32_t         sx, sy, sw, sh, px0, py0, px1, py1, cx0, cx1;
 	int32_t         ry0, ry1;       /* the rows of the rectangle that are on the panel: all that is looked at, whatever its size */
+	const ColRun *  runs;
+	uint32_t        runCount;
 	bool            filter, unscaled;
 };
 
@@ -917,17 +1189,123 @@ IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32
 			const uint32_t * __restrict column = fColumn + cx0;
 			const uint16_t * __restrict weights = fColumnWeight + cx0;
 			uint32_t * __restrict out = to + cx0;
+			typedef uint64_t __attribute__((may_alias)) wcomb64_t;
+			uint32_t i = 0, n = (uint32_t) (cx1 - cx0);
 
-			for (uint32_t i = 0, n = (uint32_t) (cx1 - cx0); i < n; i++) {
+			if (i < n && (((uintptr_t) (out + i)) & 7) != 0) {
+				uint32_t c = column[i], w = weights[i], a = from[c];
+
+				out[i] = w == 0 || a == from[c + 1] ? a : blend(a, from[c + 1], w);
+				i++;
+			}
+			for (; i + 2 <= n; i += 2) {
+				uint32_t c0 = column[i], w0 = weights[i], a0 = from[c0];
+				uint32_t c1 = column[i + 1], w1 = weights[i + 1], a1 = from[c1];
+				uint32_t p0 = w0 == 0 || a0 == from[c0 + 1] ? a0 : blend(a0, from[c0 + 1], w0);
+				uint32_t p1 = w1 == 0 || a1 == from[c1 + 1] ? a1 : blend(a1, from[c1 + 1], w1);
+
+				*(wcomb64_t *) (out + i) = (uint64_t) p0 | ((uint64_t) p1 << 32);
+			}
+			for (; i < n; i++) {
 				uint32_t c = column[i], w = weights[i], a = from[c];
 
 				out[i] = w == 0 || a == from[c + 1] ? a : blend(a, from[c + 1], w);
 			}
+		} else if (!fDiff && job->runCount != 0) {
+			const ColRun * __restrict runs = job->runs;
+			uint32_t runCount = job->runCount;
+			typedef uint64_t __attribute__((may_alias)) wcomb64_t;
+
+			if (y + 2 < y1) {
+				const uint8_t * nextRow = pixels + (size_t) (sy + (int64_t) (y + 2 - py0) * sh / (py1 - py0)) * stride;
+
+				for (uint32_t p = 0; p < (uint32_t) sw * 4; p += 256) {
+					__builtin_prefetch(nextRow + p, 0, 0);
+				}
+			}
+			for (uint32_t r = 0; r < runCount; r++) {
+				uint32_t * __restrict d = to + runs[r].dstX;
+				const uint32_t * __restrict s = from + runs[r].srcX;
+				uint32_t n = runs[r].len;
+
+				if (n >= 1 && (((uintptr_t) d) & 7) != 0) {
+					*d++ = *s++;
+					n--;
+				}
+				while (n >= 8) {
+					wcomb64_t * __restrict d64 = (wcomb64_t *) d;
+					uint64_t v0 = (uint64_t) s[0] | ((uint64_t) s[1] << 32);
+					uint64_t v1 = (uint64_t) s[2] | ((uint64_t) s[3] << 32);
+					uint64_t v2 = (uint64_t) s[4] | ((uint64_t) s[5] << 32);
+					uint64_t v3 = (uint64_t) s[6] | ((uint64_t) s[7] << 32);
+
+					d64[0] = v0;
+					d64[1] = v1;
+					d64[2] = v2;
+					d64[3] = v3;
+					d += 8;
+					s += 8;
+					n -= 8;
+				}
+				while (n >= 2) {
+					*(wcomb64_t *) d = (uint64_t) s[0] | ((uint64_t) s[1] << 32);
+					d += 2;
+					s += 2;
+					n -= 2;
+				}
+				if (n != 0) {
+					*d = *s;
+				}
+			}
 		} else {
-			for (int32_t x = cx0; x < cx1; x++) {
-				to[x] = from[fColumn[x]];
+			const uint32_t * __restrict column = fColumn;
+			typedef uint64_t __attribute__((may_alias)) wcomb64_t;
+			int32_t x = cx0;
+
+			if (x < cx1 && (((uintptr_t) (to + x)) & 7) != 0) {
+				to[x] = from[column[x]];
+				x++;
+			}
+			for (; x + 4 <= cx1; x += 4) {
+				if (x + 20 <= cx1) {
+					__builtin_prefetch(&from[column[x + 16]], 0, 0);
+				}
+				uint32_t a0 = from[column[x]];
+				uint32_t a1 = from[column[x + 1]];
+				uint32_t a2 = from[column[x + 2]];
+				uint32_t a3 = from[column[x + 3]];
+				wcomb64_t * __restrict out64 = (wcomb64_t *) (to + x);
+
+				out64[0] = (uint64_t) a0 | ((uint64_t) a1 << 32);
+				out64[1] = (uint64_t) a2 | ((uint64_t) a3 << 32);
+			}
+			for (; x + 2 <= cx1; x += 2) {
+				*(wcomb64_t *) (to + x) = (uint64_t) from[column[x]] | ((uint64_t) from[column[x + 1]] << 32);
+			}
+			for (; x < cx1; x++) {
+				to[x] = from[column[x]];
 			}
 		}
+	}
+}
+
+void
+IOMobileFramebuffer::drawHelperChunks(const RowJob * job, uint32_t * blendRow)
+{
+	static const int32_t kRowChunk = 64;
+
+	for (;;) {
+		int32_t y0 = __atomic_fetch_add(&fHelperNextRow, kRowChunk, __ATOMIC_RELAXED);
+		int32_t y1;
+
+		if (y0 >= job->ry1) {
+			break;
+		}
+		y1 = y0 + kRowChunk;
+		if (y1 > job->ry1) {
+			y1 = job->ry1;
+		}
+		drawRows(job, y0, y1, blendRow);
 	}
 }
 
@@ -944,7 +1322,6 @@ IOMobileFramebuffer::helperMain(void * self, wait_result_t result __unused)
 	IOLockUnlock(fb->fHelperLock);
 	for (;;) {
 		const RowJob * job;
-		int32_t rows, y0, y1;
 		uint32_t * blend;
 
 		IOLockLock(fb->fHelperLock);
@@ -954,12 +1331,8 @@ IOMobileFramebuffer::helperMain(void * self, wait_result_t result __unused)
 		done = fb->fHelperGeneration;
 		job = fb->fHelperJob;
 		IOLockUnlock(fb->fHelperLock);
-		/* share index + 1 of fThreads (the presenter takes share 0) */
-		rows = job->ry1 - job->ry0;
-		y0 = job->ry0 + (int32_t) ((int64_t) rows * (index + 1) / fb->fThreads);
-		y1 = job->ry0 + (int32_t) ((int64_t) rows * (index + 2) / fb->fThreads);
 		blend = fb->fHelperBlend[index];
-		fb->drawRows(job, y0, y1, blend);
+		fb->drawHelperChunks(job, blend);
 		IOLockLock(fb->fHelperLock);
 		fb->fHelpersBusy--;
 		if (fb->fHelpersBusy == 0) {
@@ -980,7 +1353,7 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 	int32_t sx = src[0], sy = src[1], sw = src[2], sh = src[3];
 	int32_t dx = dst[0], dy = dst[1], dw = dst[2], dh = dst[3];
 	int32_t px0, py0, px1, py1, cx0, cx1;
-	bool filter = gFilter != 0;
+	bool filter = gFilter == 1 || (gFilter == 2 && fFilterStill);
 	RowJob job;
 
 	if (sw <= 0 || sh <= 0) {
@@ -1085,20 +1458,47 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 	job.cx1 = cx1;
 	job.ry0 = py0 < 0 ? 0 : py0;
 	job.ry1 = py1 > (int32_t) fPanelHeight ? (int32_t) fPanelHeight : py1;
+	uint32_t runCount = 0;
+
+	if (!filter && cx0 < cx1 && fColRuns != NULL) {
+		uint32_t rDst = (uint32_t) cx0;
+		uint32_t rSrc = fColumn[cx0];
+		uint32_t rLen = 1;
+
+		for (int32_t x = cx0 + 1; x < cx1; x++) {
+			uint32_t c = fColumn[x];
+
+			if (c == rSrc + rLen) {
+				rLen++;
+			} else {
+				fColRuns[runCount++] = (ColRun) { rDst, rSrc, rLen };
+				rDst = (uint32_t) x;
+				rSrc = c;
+				rLen = 1;
+			}
+		}
+		fColRuns[runCount++] = (ColRun) { rDst, rSrc, rLen };
+		if (runCount * 3 > (uint32_t) (cx1 - cx0)) {
+			runCount = 0;
+		}
+	}
+	job.runs = fColRuns;
+	job.runCount = runCount;
 	job.filter = filter;
 	job.unscaled = px1 - px0 == sw && py1 - py0 == sh && cx1 > cx0;     /* (cut at the sides: fbfit=3) */
 	if (fThreads <= 1 || fDiff || fHelpersStarted + 1 < fThreads) {
 		drawRows(&job, job.ry0, job.ry1, fBlendRow);
 		return;
 	}
-	/* shared out: the helpers take their rows, this thread the first share, then waits for them */
+	/* shared out: dynamic chunks so fast cores do not wait for slow ones */
 	IOLockLock(fHelperLock);
 	fHelperJob = &job;
+	fHelperNextRow = job.ry0;
 	fHelpersBusy = fThreads - 1;
 	fHelperGeneration++;
 	IOLockWakeup(fHelperLock, &fHelperGeneration, false);
 	IOLockUnlock(fHelperLock);
-	drawRows(&job, job.ry0, job.ry0 + (int32_t) ((int64_t) (job.ry1 - job.ry0) / fThreads), fBlendRow);
+	drawHelperChunks(&job, fBlendRow);
 	IOLockLock(fHelperLock);
 	while (fHelpersBusy != 0) {
 		IOLockSleep(fHelperLock, &fHelpersBusy, THREAD_UNINT);
@@ -1345,6 +1745,15 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 	}
 	fSwapsWaiting++;
 	IOLockWakeup(fSwapLock, fSwap, true);
+	if (gZeroCopy && gZeroCopyVsync && fFlip && !gSwapInUse) {
+		clock_interval_to_deadline(SWAP_HELD_MS, kMillisecondScale, &deadline);
+		while (fSwapsWaiting > 0) {
+			if (IOLockSleepDeadline(fSwapLock, &fSwapsWaiting, deadline, THREAD_UNINT) == THREAD_TIMED_OUT &&
+			    fSwapsWaiting > 0) {
+				break;
+			}
+		}
+	}
 	IOLockUnlock(fSwapLock);
 }
 
@@ -1358,17 +1767,65 @@ void
 IOMobileFramebuffer::presenter(void)
 {
 	static uint8_t swap[SWAP_SIZE];         /* (one thread) */
+	static uint8_t lastSwap[SWAP_SIZE];
 	MiniIOSurface * surfaces[SWAP_LAYERS];
+	MiniIOSurface * lastSurfaces[SWAP_LAYERS] = {};
+	bool haveLast = false;
 
 	for (;;) {
+		bool redrawStill = false;
+
 		IOLockLock(fSwapLock);
-		while (fSwapsWaiting == 0) {
-			IOLockSleep(fSwapLock, fSwap, THREAD_UNINT);
+		if (fSwapsWaiting == 0 && haveLast && gFilter == 2) {
+			uint64_t deadline;
+
+			clock_interval_to_deadline(40, kMillisecondScale, &deadline);
+			IOLockSleepDeadline(fSwapLock, fSwap, deadline, THREAD_UNINT);
+			if (fSwapsWaiting == 0) {
+				redrawStill = true;
+			}
 		}
-		memcpy(swap, fSwap[fSwapFirst], SWAP_SIZE);
-		memcpy(surfaces, fSwapSurfaces[fSwapFirst], sizeof(surfaces));
+		if (!redrawStill) {
+			while (fSwapsWaiting == 0) {
+				IOLockSleep(fSwapLock, fSwap, THREAD_UNINT);
+			}
+			memcpy(swap, fSwap[fSwapFirst], SWAP_SIZE);
+			memcpy(surfaces, fSwapSurfaces[fSwapFirst], sizeof(surfaces));
+		}
 		IOLockUnlock(fSwapLock);
+
+		if (redrawStill) {
+			fFilterStill = true;
+			show(lastSwap, lastSurfaces, true);
+			for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+				if (lastSurfaces[layer] != NULL) {
+					MiniIOSurfaceDrop(lastSurfaces[layer]);
+					lastSurfaces[layer] = NULL;
+				}
+			}
+			haveLast = false;
+			continue;
+		}
+
+		for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+			if (lastSurfaces[layer] != NULL) {
+				MiniIOSurfaceDrop(lastSurfaces[layer]);
+				lastSurfaces[layer] = NULL;
+			}
+		}
+		haveLast = false;
+		fFilterStill = false;
 		show(swap, surfaces);
+		if (gFilter == 2 && !fOvlDirect) {
+			memcpy(lastSwap, swap, SWAP_SIZE);
+			for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+				uint32_t sid = swapWord(swap, SWAP_SURFACE(layer));
+				lastSurfaces[layer] = sid != 0 ? MiniIOSurfaceCopy(sid) : NULL;
+				if (lastSurfaces[layer] != NULL) {
+					haveLast = true;
+				}
+			}
+		}
 		for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
 			if (surfaces[layer] != NULL) {
 				if (gSwapInUse) {
@@ -1383,7 +1840,7 @@ IOMobileFramebuffer::presenter(void)
 
 /* A swap's surfaces onto the panel, once the GPU is done with them. */
 void
-IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
+IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces, bool redraw)
 {
 	uint32_t set = swapWord(swap, SWAP_LAYERS_SET);
 	uint64_t began = mach_absolute_time(), nanos, ready, shown, drawn;
@@ -1391,15 +1848,17 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	MiniIOSurface * recorded = NULL;
 	bool report;
 
-	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
-		if (surfaces[layer] != NULL && !MiniIOSurfaceDrawn(surfaces[layer], SWAP_GPU_MS)) {
-			IOLog("MiniIOMobileFramebuffer: swap %u: the GPU is not done with surface %u after %u ms; shown as it is\n",
-			    swapWord(swap, SWAP_ID), swapWord(swap, SWAP_SURFACE(layer)), SWAP_GPU_MS);
+	if (!redraw) {
+		for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+			if (surfaces[layer] != NULL && !MiniIOSurfaceDrawn(surfaces[layer], SWAP_GPU_MS)) {
+				IOLog("MiniIOMobileFramebuffer: swap %u: the GPU is not done with surface %u after %u ms; shown as it is\n",
+				    swapWord(swap, SWAP_ID), swapWord(swap, SWAP_SURFACE(layer)), SWAP_GPU_MS);
+			}
 		}
+		fStatWaiting += mach_absolute_time() - began;
 	}
-	fStatWaiting += mach_absolute_time() - began;
 	began = ready = mach_absolute_time();
-	if (gOnTheBeat) {
+	if (gOnTheBeat && !redraw) {
 		uint64_t period, aim, next;
 
 		nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz(), &period);
@@ -1425,78 +1884,123 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	}
 	shown = began;
 	IOLockLock(fLock);
-	if (fLastFrame != 0) {
-		absolutetime_to_nanoseconds(began - fLastFrame, &nanos);
-		nanos /= NSEC_PER_MSEC;
-		if (nanos >= FRAME_PAUSE) {
-			fFramePauses++;
-		} else {
-			fFrameTimes[nanos < FRAME_TIMES ? nanos : FRAME_TIMES]++;
-			fFrameLongest = nanos > fFrameLongest ? (uint32_t) nanos : fFrameLongest;
+	if (!redraw) {
+		if (fLastFrame != 0) {
+			absolutetime_to_nanoseconds(began - fLastFrame, &nanos);
+			nanos /= NSEC_PER_MSEC;
+			if (nanos >= FRAME_PAUSE) {
+				fFramePauses++;
+			} else {
+				fFrameTimes[nanos < FRAME_TIMES ? nanos : FRAME_TIMES]++;
+				fFrameLongest = nanos > fFrameLongest ? (uint32_t) nanos : fFrameLongest;
+			}
 		}
+		fLastFrame = began;
 	}
-	fLastFrame = began;
-	report = fSwapsShown < 8;
+	report = !redraw && fSwapsShown < 8;
 	if (report) {
 		IOLog("MiniIOMobileFramebuffer: swap %u (#%u): surfaces %u %u %u %u, layers set 0x%x cleared 0x%x\n",
 		    swapWord(swap, SWAP_ID), fSwapsShown, swapWord(swap, SWAP_SURFACE(0)), swapWord(swap, SWAP_SURFACE(1)),
 		    swapWord(swap, SWAP_SURFACE(2)), swapWord(swap, SWAP_SURFACE(3)), set, swapWord(swap, SWAP_LAYERS_CLEARED));
 	}
-	if (fFlip) {
-		fBase = fFlipVA[fFront ^ 1];    /* (the picture not on the panel) */
-	}
-	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
-		uint32_t sid = swapWord(swap, SWAP_SURFACE(layer));
-		int32_t src[4], dst[4];
-		MiniIOSurface * s;
-
-		layers |= sid != 0 ? 1u << layer : 0;
-		/* the frames' surfaces: is it a few, in turn? */
-		for (unsigned i = 0; layer == 0 && sid != 0 && i < 8; i++) {
-			if (fStatSurfaces[i] == 0 || fStatSurfaces[i] == sid) {
-				fStatSurfaces[i] = sid;
+	if (tryDirectScanout(swap, surfaces)) {
+		layers = 1;
+		for (unsigned i = 0; i < 8; i++) {
+			if (fStatSurfaces[i] == 0 || fStatSurfaces[i] == surfaces[0]->sid) {
+				fStatSurfaces[i] = surfaces[0]->sid;
 				break;
 			}
 		}
-		if (sid == 0) {
-			/* the bottom layer taken away: nothing is shown, the screen is black */
-			if (layer == 0 && (set & 1) && fGraphics) {
-				for (uint32_t y = 0; y < fPanelHeight; y++) {
-					bzero(fBase + (size_t) y * fRowBytes, (size_t) fPanelWidth * 4);
+		recorded = surfaces[0];
+		gShownSurface = surfaces[0]->sid;
+	} else {
+		unsigned next = 0;
+
+		fBlitCount++;
+		if (fFlip) {
+			if (fRdma != NULL && (fRdma[FLIP_RDMA_INT_STA / 4] & FLIP_RDMA_FRAME_START) != 0) {
+				fRdma[FLIP_RDMA_INT_STA / 4] = 0;
+				fFlipsSinceVsync = 0;
+			}
+			if (fRdma != NULL && fFlipsSinceVsync >= fFlipCount - 1) {
+				waitVSync();
+				fFlipsSinceVsync = 0;
+			}
+			next = (fFront + 1) % fFlipCount;
+			fBase = fFlipVA[next];          /* a buffer not scanned by OVL0 */
+		}
+		for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+			uint32_t sid = swapWord(swap, SWAP_SURFACE(layer));
+			int32_t src[4], dst[4];
+			MiniIOSurface * s;
+
+			layers |= sid != 0 ? 1u << layer : 0;
+			/* the frames' surfaces: is it a few, in turn? */
+			for (unsigned i = 0; layer == 0 && sid != 0 && i < 8; i++) {
+				if (fStatSurfaces[i] == 0 || fStatSurfaces[i] == sid) {
+					fStatSurfaces[i] = sid;
+					break;
 				}
 			}
-			continue;
-		}
-		memcpy(src, swap + SWAP_SOURCE(layer), sizeof(src));
-		memcpy(dst, swap + SWAP_DEST(layer), sizeof(dst));
-		s = surfaces[layer];
-		if (report) {
-			IOLog("MiniIOMobileFramebuffer: swap %u layer %u: surface %u%s (%ux%u '%c%c%c%c') "
-			    "from %d,%d %dx%d to %d,%d %dx%d, layers set 0x%x\n", swapWord(swap, SWAP_ID), layer, sid,
-			    s ? "" : " MISSING", s ? s->info.width : 0, s ? s->info.height : 0,
-			    s ? (int) (s->info.pixelFormat >> 24 & 0xff) : '?', s ? (int) (s->info.pixelFormat >> 16 & 0xff) : '?',
-			    s ? (int) (s->info.pixelFormat >> 8 & 0xff) : '?', s ? (int) (s->info.pixelFormat & 0xff) : '?',
-			    src[0], src[1], src[2], src[3], dst[0], dst[1], dst[2], dst[3], set);
-		}
-		if (s == NULL) {
-			continue;
-		}
-		if (s->info.bytesPerElement == 4 && s->info.planeCount == 0) {
-			if (!fGraphics) {
-				/* the first picture: the kernel's text console must stop drawing over it */
-				fGraphics = true;
-				PE_initialize_console(NULL, kPEGraphicsMode);
+			if (sid == 0) {
+				/* the bottom layer taken away: nothing is shown, the screen is black */
+				if (layer == 0 && (set & 1) && fGraphics) {
+					for (uint32_t y = 0; y < fPanelHeight; y++) {
+						bzero(fBase + (size_t) y * fRowBytes, (size_t) fPanelWidth * 4);
+					}
+				}
+				continue;
 			}
-			drawLayer(s, src, dst);
-			if (layer == 0) {
-				recorded = s;   /* (recorded once the frame is in the panel's memory: see below) */
+			memcpy(src, swap + SWAP_SOURCE(layer), sizeof(src));
+			memcpy(dst, swap + SWAP_DEST(layer), sizeof(dst));
+			s = surfaces[layer];
+			if (report) {
+				IOLog("MiniIOMobileFramebuffer: swap %u layer %u: surface %u%s (%ux%u '%c%c%c%c') "
+				    "from %d,%d %dx%d to %d,%d %dx%d, layers set 0x%x\n", swapWord(swap, SWAP_ID), layer, sid,
+				    s ? "" : " MISSING", s ? s->info.width : 0, s ? s->info.height : 0,
+				    s ? (int) (s->info.pixelFormat >> 24 & 0xff) : '?', s ? (int) (s->info.pixelFormat >> 16 & 0xff) : '?',
+				    s ? (int) (s->info.pixelFormat >> 8 & 0xff) : '?', s ? (int) (s->info.pixelFormat & 0xff) : '?',
+				    src[0], src[1], src[2], src[3], dst[0], dst[1], dst[2], dst[3], set);
+			}
+			if (s == NULL) {
+				continue;
+			}
+			if (s->info.bytesPerElement == 4 && s->info.planeCount == 0) {
+				if (!fGraphics) {
+					/* the first picture: the kernel's text console must stop drawing over it */
+					fGraphics = true;
+					PE_initialize_console(NULL, kPEGraphicsMode);
+				}
+				drawLayer(s, src, dst);
+				if (layer == 0) {
+					recorded = s;   /* (recorded once the frame is in the panel's memory: see below) */
+					gShownSurface = sid;
+				}
 			}
 		}
-	}
-	if (fFlip) {
-		fFront ^= 1;
-		fOvl[FLIP_OVL_L0_ADDR / 4] = fFlipPA[fFront];
-		__builtin_arm_dsb(0xf);
+		if (fFlip) {
+			bool wasDirect = fOvlDirect;
+			__builtin_arm_dsb(0xf);
+			restoreOvlDefault();
+			fFront = next;
+			fOvl[FLIP_OVL_L0_ADDR / 4] = fFlipPA[fFront];
+			__builtin_arm_dsb(0xf);
+			if (wasDirect) {
+				waitVSync();
+				fFlipsSinceVsync = 0;
+			} else {
+				if (fRdma != NULL && (fRdma[FLIP_RDMA_INT_STA / 4] & FLIP_RDMA_FRAME_START) != 0) {
+					fRdma[FLIP_RDMA_INT_STA / 4] = 0;
+				}
+				fFlipsSinceVsync++;
+			}
+			MiniIOSurface * prev = fHeldSurface[0];
+			fHeldSurface[0] = NULL;
+			if (prev != NULL) {
+				MiniIOSurfaceUse(prev, -1);
+				MiniIOSurfaceDrop(prev);
+			}
+		}
 	}
 	drawn = mach_absolute_time();
 	/*
@@ -1506,11 +2010,13 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	 * frame and part of the next -- 768 frames begun in a surface the display still held in run
 	 * 228 (hakiosmetal.m counts them), the "breakcore" of every video of the Metal port.
 	 */
-	IOLockLock(fSwapLock);
-	fSwapFirst = (fSwapFirst + 1) % SWAP_QUEUE;
-	fSwapsWaiting--;
-	IOLockWakeup(fSwapLock, &fSwapsWaiting, true);
-	IOLockUnlock(fSwapLock);
+	if (!redraw) {
+		IOLockLock(fSwapLock);
+		fSwapFirst = (fSwapFirst + 1) % SWAP_QUEUE;
+		fSwapsWaiting--;
+		IOLockWakeup(fSwapLock, &fSwapsWaiting, true);
+		IOLockUnlock(fSwapLock);
+	}
 	if (recorded != NULL) {
 		record(recorded);
 	}
@@ -1559,6 +2065,14 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		    fStatFrames * NSEC_PER_SEC / nanos, drawing / fStatFrames / NSEC_PER_USEC,
 		    waiting / fStatFrames / NSEC_PER_USEC, fStatOnBeat, fStatOnBeat ? beat / fStatOnBeat / NSEC_PER_USEC : 0,
 		    fStatHeld, fStatLost, fStatSwapsLate);
+		if (fFlip) {
+			uint64_t vsNs = 0;
+
+			absolutetime_to_nanoseconds(fVsyncWaitNs, &vsNs);
+			IOLog("MiniIOMobileFramebuffer: flip path: scans=%u blits=%u vsync=%u ok/%u tmo uf=%u (avg %llu us)\n",
+			    fScanCount, fBlitCount, fVsyncOk, fVsyncTmo, fRdmaUnderflow,
+			    (fVsyncOk + fVsyncTmo) ? (vsNs / (fVsyncOk + fVsyncTmo) / NSEC_PER_USEC) : 0);
+		}
 		if (recorded != NULL) {
 			/* what this frame looks like, for a run nobody watches: its average colour, and how much of it is not black */
 			uint64_t sum[3] = { 0, 0, 0 };
@@ -2115,6 +2629,12 @@ IOAcceleratorES::setProperties(OSObject * properties)
 static void
 publishAccelerator(IOService * provider)
 {
+	/* With vivagpu=1 the VivaGPUAccelerator is the sole IOAcceleratorES (Metal's lookup class);
+	 * publishing this stub too makes Metal pick the wrong device. */
+	int vivagpu_skip = 0;
+	if (PE_parse_boot_argn("vivagpu", &vivagpu_skip, sizeof(vivagpu_skip)) && vivagpu_skip != 0) {
+		return;
+	}
 	IOAcceleratorES * accelerator = OSTypeAlloc(IOAcceleratorES);
 	uint32_t metal = 0;
 
@@ -2129,7 +2649,11 @@ publishAccelerator(IOService * provider)
 		 * Never by default: with them a program that asks for Metal gets a device, and CoreAnimation would choose
 		 * Metal for the screen; until that device can draw, a screen drawn without it is the working one.
 		 */
-		if (PE_parse_boot_argn("metal", &metal, sizeof(metal)) && metal != 0) {
+		int vivagpu = 0;
+		PE_parse_boot_argn("vivagpu", &vivagpu, sizeof(vivagpu));
+		if (PE_parse_boot_argn("metal", &metal, sizeof(metal)) && metal != 0 && vivagpu == 0) {
+			/* With vivagpu=1 the VivaGPUAccelerator service advertises the real Metal plug-in;
+			 * this stub accelerator must NOT also name one or Metal picks the wrong device. */
 			accelerator->setProperty("MetalPluginName", "HakiosMetal");
 			accelerator->setProperty("MetalPluginClassName", "HakiosMetalDevice");
 			IOLog("MiniIOMobileFramebuffer: metal=1: the accelerator names HakiosMetal as its Metal plug-in\n");

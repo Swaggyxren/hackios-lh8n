@@ -8,19 +8,24 @@
  * there is one GPU and one connection to it in a process.
  */
 #include <errno.h>
+#include <pthread.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <IOKit/IOKitLib.h>
 
 #include "xf86drm.h"
+#include "drm-uapi/panfrost_drm.h"
 
 #define HAKIOS_GPU_SERVICE     "HakiosGPU"     /* the Adreno (iokit/Kernel/hakios.gpu.cpp) */
 #define HAKIOS_MALI_SERVICE    "HakiosPanfrostGPU"   /* the Mali (iokit/Kernel/hakios.mali.cpp) */
 #define HAKIOS_SURFACE         0x7e            /* the request that is not Linux's */
 #define HAKIOS_DESCRIBE        0xffffffffu     /* ... asked only what the buffer would be like */
 #define HAKIOS_WAIT            0x7d            /* a job's number, waited for */
+#define HAKIOS_SUBMIT_PAIR     0x7c            /* vertex/tiler + fragment chains submitted together */
 
 static int is_panfrost;
 
@@ -84,28 +89,218 @@ call(unsigned number, void *data, size_t size)
 	}
 }
 
+struct hakios_submit_pair {
+	uint64_t jc;
+	uint64_t frag_jc;
+	uint64_t bo_handles;
+	uint32_t bo_handle_count;
+	uint32_t requirements;
+};
+
 struct hakios_wait {
 	uint64_t seq;
 	int64_t timeout_ns;
 };
 
-int
-drmIoctl(int fd, unsigned long request, void *arg)
+#define MAX_SYNCOBJS    1024
+#define MAX_BO_CACHE    4097
+
+static pthread_mutex_t drm_sync_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t syncobj_seq[MAX_SYNCOBJS];
+static bool syncobj_used[MAX_SYNCOBJS];
+static uint64_t syncfd_seq[MAX_SYNCOBJS];
+static uint32_t syncfd_next = 1;
+static uint64_t bo_seq[MAX_BO_CACHE];
+static uint8_t bo_imported[MAX_BO_CACHE];
+static uint64_t cached_done_seq;
+
+static void
+advance_done_seq(uint64_t seq)
 {
-	unsigned number = (unsigned)(request & 0xff);
-	int error = call(number, arg, IOCPARM_LEN(request));
+	uint64_t cur = __atomic_load_n(&cached_done_seq, __ATOMIC_RELAXED);
+
+	while (cur < seq) {
+		if (__atomic_compare_exchange_n(&cached_done_seq, &cur, seq, false,
+		    __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
+			break;
+		}
+	}
+}
+
+static int
+wait_seq(uint64_t seq, int64_t rel_timeout_ns)
+{
+	struct hakios_wait w;
+	int error;
+
+	if (seq == 0 || seq <= __atomic_load_n(&cached_done_seq, __ATOMIC_ACQUIRE)) {
+		return 0;
+	}
+	w.seq = seq;
+	w.timeout_ns = rel_timeout_ns;
+	error = call(HAKIOS_WAIT, &w, sizeof(w));
+	if (error != 0) {
+		return error;
+	}
+	advance_done_seq(seq);
+	return 0;
+}
+
+static int64_t
+abs_to_rel_ns(int64_t timeout_nsec)
+{
+	struct timespec ts;
+	int64_t now_ns;
+
+	if (timeout_nsec <= 0) {
+		return 0;
+	}
+	if (timeout_nsec == INT64_MAX) {
+		return 10000000000LL;
+	}
+#ifdef CLOCK_UPTIME_RAW
+	clock_gettime(CLOCK_UPTIME_RAW, &ts);
+#else
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+#endif
+	now_ns = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+	return timeout_nsec > now_ns ? timeout_nsec - now_ns : 0;
+}
+
+static void
+record_submitted_seq(uint64_t seq, uint64_t done_seq, uint32_t out_sync, const uint32_t *handles, uint32_t count)
+{
+	if (done_seq != 0) {
+		advance_done_seq(done_seq);
+	}
+	if (seq != 0) {
+		pthread_mutex_lock(&drm_sync_lock);
+		if (out_sync > 0 && out_sync < MAX_SYNCOBJS) {
+			syncobj_seq[out_sync] = seq;
+		}
+		for (uint32_t i = 0; handles != NULL && i < count; i++) {
+			uint32_t h = handles[i];
+			if (h > 0 && h < MAX_BO_CACHE) {
+				bo_seq[h] = seq;
+			}
+		}
+		pthread_mutex_unlock(&drm_sync_lock);
+	}
+}
+
+int
+hakios_drm_submit_pair(int fd, uint64_t vtc_jc, uint64_t frag_jc, uint32_t requirements,
+    uint32_t out_sync, const uint32_t *bo_handles, uint32_t bo_handle_count)
+{
+	struct hakios_submit_pair p = {
+		.jc = vtc_jc,
+		.frag_jc = frag_jc,
+		.bo_handles = (uint64_t)(uintptr_t)bo_handles,
+		.bo_handle_count = bo_handle_count,
+		.requirements = requirements,
+	};
+	int error;
 
 	(void)fd;
+	error = call(HAKIOS_SUBMIT_PAIR, &p, sizeof(p));
 	if (error != 0) {
 		errno = error;
 		return -1;
 	}
-	/*
-	 * The Mali service queues a job chain and hands its number back in submit.jc. Every job
-	 * must be over before the call returns here, so the syncobjs a driver waits on can all be
-	 * said to be signalled (see below). The Adreno service runs its jobs before returning.
-	 */
-	/* our driver is synchronous; no HAKIOS_WAIT */
+	record_submitted_seq(p.jc, p.frag_jc, out_sync, bo_handles, bo_handle_count);
+	return 0;
+}
+
+int
+drmIoctl(int fd, unsigned long request, void *arg)
+{
+	unsigned number = (unsigned)(request & 0xff);
+	uint64_t orig_jc = 0, orig_in_syncs = 0;
+	int error;
+
+	(void)fd;
+	if (is_panfrost && number == (DRM_IOCTL_PANFROST_MADVISE & 0xff) && arg != NULL) {
+		struct drm_panfrost_madvise *m = arg;
+
+		m->retained = 1;
+		return 0;
+	}
+	if (is_panfrost && number == (DRM_IOCTL_PANFROST_WAIT_BO & 0xff) && arg != NULL) {
+		struct drm_panfrost_wait_bo *w = arg;
+		int64_t orig_timeout = w->timeout_ns;
+		uint64_t seq = 0, done_seq;
+		uint8_t imported = 1;
+
+		if (w->handle > 0 && w->handle < MAX_BO_CACHE) {
+			pthread_mutex_lock(&drm_sync_lock);
+			seq = bo_seq[w->handle];
+			imported = bo_imported[w->handle];
+			pthread_mutex_unlock(&drm_sync_lock);
+			done_seq = __atomic_load_n(&cached_done_seq, __ATOMIC_ACQUIRE);
+			if ((!imported && seq == 0) || (seq != 0 && seq <= done_seq)) {
+				return 0;
+			}
+		}
+		error = call(number, arg, IOCPARM_LEN(request));
+		if (error == 0) {
+			done_seq = (uint64_t)w->timeout_ns;
+			w->timeout_ns = orig_timeout;
+			if (done_seq > seq) {
+				seq = done_seq;
+			}
+			if (seq != 0) {
+				advance_done_seq(seq);
+			}
+		} else {
+			w->timeout_ns = orig_timeout;
+		}
+		if (error != 0) {
+			errno = error;
+			return -1;
+		}
+		return 0;
+	}
+
+	if (is_panfrost && number == (DRM_IOCTL_PANFROST_SUBMIT & 0xff) && arg != NULL) {
+		struct drm_panfrost_submit *s = arg;
+		orig_jc = s->jc;
+		orig_in_syncs = s->in_syncs;
+	}
+
+	error = call(number, arg, IOCPARM_LEN(request));
+	if (error != 0) {
+		errno = error;
+		return -1;
+	}
+
+	if (is_panfrost && number == (DRM_IOCTL_PANFROST_CREATE_BO & 0xff) && arg != NULL) {
+		uint32_t h = ((struct drm_panfrost_create_bo *)arg)->handle;
+
+		if (h > 0 && h < MAX_BO_CACHE) {
+			pthread_mutex_lock(&drm_sync_lock);
+			bo_seq[h] = 0;
+			bo_imported[h] = 0;
+			pthread_mutex_unlock(&drm_sync_lock);
+		}
+	} else if (is_panfrost && number == (DRM_IOCTL_GEM_CLOSE & 0xff) && arg != NULL) {
+		uint32_t h = ((struct drm_gem_close *)arg)->handle;
+
+		if (h > 0 && h < MAX_BO_CACHE) {
+			pthread_mutex_lock(&drm_sync_lock);
+			bo_seq[h] = 0;
+			bo_imported[h] = 0;
+			pthread_mutex_unlock(&drm_sync_lock);
+		}
+	} else if (is_panfrost && number == (DRM_IOCTL_PANFROST_SUBMIT & 0xff) && arg != NULL) {
+		struct drm_panfrost_submit *s = arg;
+		uint64_t seq = s->jc;
+		uint64_t done_seq = s->in_syncs;
+		const uint32_t *handles = (const uint32_t *)(uintptr_t)s->bo_handles;
+
+		s->jc = orig_jc;
+		s->in_syncs = orig_in_syncs;
+		record_submitted_seq(seq, done_seq, s->out_sync, handles, s->bo_handle_count);
+	}
 	return 0;
 }
 
@@ -226,6 +421,11 @@ drmPrimeFDToHandle(int fd, int surface, uint32_t *handle)
 		return -1;
 	}
 	*handle = request.handle;
+	if (is_panfrost && request.handle > 0 && request.handle < MAX_BO_CACHE) {
+		pthread_mutex_lock(&drm_sync_lock);
+		bo_imported[request.handle] = 1;
+		pthread_mutex_unlock(&drm_sync_lock);
+	}
 	return 0;
 }
 
@@ -241,72 +441,152 @@ none(void)
 NONE(drmPrimeHandleToFD, __attribute__((unused)) int fd, __attribute__((unused)) uint32_t handle,
     __attribute__((unused)) uint32_t flags, __attribute__((unused)) int *prime_fd)
 /*
- * Fences are the one thing this driver's jobs do not need: a job is over before SUBMIT returns
- * (see drmIoctl). So every syncobj is created already signalled, waits answer at once, and a
- * sync file is a descriptor to /dev/null: what a consumer waits on is already done.
+ * Userspace syncobjs backed by kernel job sequence numbers (submit.jc -> HAKIOS_WAIT).
  */
-static uint32_t next_syncobj = 1;
+static int
+alloc_syncobj(uint32_t *handle)
+{
+	pthread_mutex_lock(&drm_sync_lock);
+	for (uint32_t i = 1; i < MAX_SYNCOBJS; i++) {
+		if (!syncobj_used[i]) {
+			syncobj_used[i] = true;
+			syncobj_seq[i] = 0;
+			pthread_mutex_unlock(&drm_sync_lock);
+			*handle = i;
+			return 0;
+		}
+	}
+	pthread_mutex_unlock(&drm_sync_lock);
+	errno = ENOMEM;
+	return -1;
+}
 
 int
 drmSyncobjCreate(int fd, uint32_t flags, uint32_t *handle)
 {
 	(void)fd; (void)flags;
-	*handle = next_syncobj++;
+	return alloc_syncobj(handle);
+}
+
+int
+drmSyncobjDestroy(int fd, uint32_t handle)
+{
+	(void)fd;
+	if (handle > 0 && handle < MAX_SYNCOBJS) {
+		pthread_mutex_lock(&drm_sync_lock);
+		syncobj_used[handle] = false;
+		syncobj_seq[handle] = 0;
+		pthread_mutex_unlock(&drm_sync_lock);
+	}
 	return 0;
 }
+
 int
-drmSyncobjDestroy(int fd, uint32_t handle) { (void)fd; (void)handle; return 0; }
-int
-drmSyncobjReset(int fd, const uint32_t *handles, uint32_t count) { (void)fd; (void)handles; (void)count; return 0; }
+drmSyncobjReset(int fd, const uint32_t *handles, uint32_t count)
+{
+	(void)fd;
+	pthread_mutex_lock(&drm_sync_lock);
+	for (uint32_t i = 0; handles != NULL && i < count; i++) {
+		if (handles[i] > 0 && handles[i] < MAX_SYNCOBJS) {
+			syncobj_seq[handles[i]] = 0;
+		}
+	}
+	pthread_mutex_unlock(&drm_sync_lock);
+	return 0;
+}
+
 int
 drmSyncobjFDToHandle(int fd, int obj_fd, uint32_t *handle)
 {
-	(void)fd; (void)obj_fd;
-	*handle = next_syncobj++;
-	return 0;
+	int ret = alloc_syncobj(handle);
+
+	(void)fd;
+	if (ret == 0 && obj_fd >= 0) {
+		pthread_mutex_lock(&drm_sync_lock);
+		syncobj_seq[*handle] = syncfd_seq[obj_fd & (MAX_SYNCOBJS - 1)];
+		pthread_mutex_unlock(&drm_sync_lock);
+	}
+	return ret;
 }
+
 int
 drmSyncobjHandleToFD(int fd, uint32_t handle, int *obj_fd)
 {
-	(void)fd; (void)handle;
-	*obj_fd = open("/dev/null", O_RDONLY);
-	return *obj_fd < 0 ? -1 : 0;
+	int out;
+
+	(void)fd;
+	pthread_mutex_lock(&drm_sync_lock);
+	out = 0x40000000 | (int)(syncfd_next++ & (MAX_SYNCOBJS - 1));
+	syncfd_seq[out & (MAX_SYNCOBJS - 1)] = (handle > 0 && handle < MAX_SYNCOBJS) ? syncobj_seq[handle] : 0;
+	pthread_mutex_unlock(&drm_sync_lock);
+	*obj_fd = out;
+	return 0;
 }
+
 int
 drmSyncobjImportSyncFile(int fd, uint32_t handle, int sync_file_fd)
 {
-	(void)fd; (void)handle; (void)sync_file_fd;
+	(void)fd;
+	if (handle > 0 && handle < MAX_SYNCOBJS && sync_file_fd >= 0) {
+		pthread_mutex_lock(&drm_sync_lock);
+		syncobj_seq[handle] = syncfd_seq[sync_file_fd & (MAX_SYNCOBJS - 1)];
+		pthread_mutex_unlock(&drm_sync_lock);
+	}
 	return 0;
 }
+
 int
 drmSyncobjExportSyncFile(int fd, uint32_t handle, int *sync_file_fd)
 {
-	(void)fd; (void)handle;
-	*sync_file_fd = open("/dev/null", O_RDONLY);
-	return *sync_file_fd < 0 ? -1 : 0;
+	return drmSyncobjHandleToFD(fd, handle, sync_file_fd);
 }
+
 int
 drmSyncobjWait(int fd, const uint32_t *handles, uint32_t count, int64_t timeout_nsec,
     uint32_t flags, uint32_t *first_signaled)
 {
-	(void)fd; (void)timeout_nsec; (void)flags;
-	if (first_signaled != NULL && count > 0)
+	uint64_t max_seq = 0;
+	int err;
+
+	(void)fd; (void)flags;
+	pthread_mutex_lock(&drm_sync_lock);
+	for (uint32_t i = 0; handles != NULL && i < count; i++) {
+		uint32_t h = handles[i];
+		if (h > 0 && h < MAX_SYNCOBJS && syncobj_seq[h] > max_seq) {
+			max_seq = syncobj_seq[h];
+		}
+	}
+	pthread_mutex_unlock(&drm_sync_lock);
+	if (is_panfrost && max_seq != 0) {
+		err = wait_seq(max_seq, abs_to_rel_ns(timeout_nsec));
+		if (err != 0) {
+			errno = err == EBUSY ? ETIMEDOUT : err;
+			return -1;
+		}
+	}
+	if (first_signaled != NULL && count > 0) {
 		*first_signaled = handles[0];
+	}
 	return 0;
 }
+
 int
 drmSyncobjTransfer(int fd, uint32_t dst_handle, uint64_t dst_point, uint32_t src_handle,
     uint64_t src_point, uint32_t flags)
 {
-	(void)fd; (void)dst_handle; (void)dst_point; (void)src_handle; (void)src_point; (void)flags;
+	(void)fd; (void)dst_point; (void)src_point; (void)flags;
+	if (dst_handle > 0 && dst_handle < MAX_SYNCOBJS) {
+		pthread_mutex_lock(&drm_sync_lock);
+		syncobj_seq[dst_handle] = (src_handle > 0 && src_handle < MAX_SYNCOBJS) ? syncobj_seq[src_handle] : 0;
+		pthread_mutex_unlock(&drm_sync_lock);
+	}
 	return 0;
 }
+
 int
 drmSyncobjTimelineWait(int fd, const uint32_t *handles, const uint64_t *points,
     uint32_t count, int64_t timeout_nsec, uint32_t flags, uint32_t *first_signaled)
 {
-	(void)fd; (void)points; (void)timeout_nsec; (void)flags;
-	if (first_signaled != NULL && count > 0)
-		*first_signaled = handles[0];
-	return 0;
+	(void)points;
+	return drmSyncobjWait(fd, handles, count, timeout_nsec, flags, first_signaled);
 }

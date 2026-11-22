@@ -32,6 +32,7 @@
  */
 
 #include <kern/clock.h>
+#include <kern/sched_prim.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
@@ -41,6 +42,9 @@
 #include <sys/systm.h>
 #include <vm/vm_kern.h>
 
+extern uint32_t gMaliClients, gMaliBuffers, gMaliSubmits, gMaliFailed;
+extern uint64_t gMaliGpuUs, gMaliJs0Us, gMaliJs1Us, gMaliJs0Count, gMaliJs1Count, gMaliPipelined;
+static int gMaliPipe = 1;
 /*
  * Lines that must reach the end-of-run log whole (the display driver's frame statistics use it).
  * The shared stubs define this only when no Mali driver is built; ours is, so it lives here.
@@ -378,8 +382,13 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern uint64_t kvtophys(vm_offset_t va);
 extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
 extern vm_offset_t phystokv(uint64_t pa);
+extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint32_t intid), void *context);
+
+#define MALI_JOB_SPI          398u
+#define MALI_JOB_IRQ_MASK     (JOB_IRQ_DONE(0) | JOB_IRQ_DONE(1) | JOB_IRQ_FAILED(0) | JOB_IRQ_FAILED(1))
 
 extern void HakiosMaliStart(void);
+extern void HakiosVivaGPUStart(void);
 extern uint32_t gMaliClients, gMaliBuffers, gMaliSubmits, gMaliFailed;
 extern struct hakios_mali_made { uint64_t address, size; uint32_t asked, flags; } gMaliMade[32];
 
@@ -399,7 +408,11 @@ static uint32_t reached, last_step, gpu_id, shader_mask;
 static int lkrails;
 static LCK_GRP_DECLARE(mali_lck_grp, "hakios-mali");
 static lck_mtx_t mali_lock;
-static lck_mtx_t mali_job_lock;
+static lck_mtx_t mali_slot_lock[2];
+static volatile uint32_t slot_irq_bits[2];
+static uint64_t mali_job_irqs;
+static bool mali_irq_attached;
+static int mali_irq_enable = 1;
 
 SYSCTL_UINT(_kern_hakios, OID_AUTO, mali, CTLFLAG_RD | CTLFLAG_LOCKED, &reached, 0,
     "how far the Mali came up: 6 is a job run through its own page tables");
@@ -435,40 +448,72 @@ mali_wait(uint64_t reg, uint32_t mask, uint32_t want, uint32_t ms)
 	return (rd(reg) & mask) == want;
 }
 
-/* B2.4: job completion usually lands in 100-400 us. mali_wait() sleeps a whole
- * 1 ms per poll, so a 300 us job wastes ~1 ms — ~6-10 ms of pure sleep/frame.
- * Poll tight first, then back off, keeping the same overall timeout. */
-static int
-mali_wait_job(uint64_t reg, uint32_t mask, uint32_t want, uint32_t ms)
+static void
+mali_job_irq(__unused void *context, __unused uint32_t intid)
 {
-	uint64_t start = mach_absolute_time(), limit, elapsed, ns;
+	uint32_t st = rd(mali + JOB_IRQ_STATUS);
 
+	if (st != 0) {
+		wr(mali + JOB_IRQ_CLEAR, st);
+		__asm__ volatile("dsb sy\n" ::: "memory");
+		mali_job_irqs++;
+		for (uint32_t s = 0; s < 2; s++) {
+			if (st & (JOB_IRQ_DONE(s) | JOB_IRQ_FAILED(s))) {
+				__atomic_fetch_or(&slot_irq_bits[s], st, __ATOMIC_RELEASE);
+				thread_wakeup((event_t)&slot_irq_bits[s]);
+			}
+		}
+	}
+}
+
+/* B2.4 / Phase 4: spin briefly (<=60 us) for tiny vertex/tiler jobs, then block
+ * on GICv3 SPI 398 (JOB_IRQ) so CPU threads yield while longer jobs run. */
+static int
+mali_wait_slot(uint32_t slot, uint32_t ms, uint32_t *raw_out)
+{
+	uint32_t mask = JOB_IRQ_DONE(slot) | JOB_IRQ_FAILED(slot);
+	uint32_t want = JOB_IRQ_DONE(slot);
+	uint64_t start = mach_absolute_time(), limit, elapsed, ns;
 	uint32_t raw;
 
 	nanoseconds_to_absolutetime((uint64_t)ms * NSEC_PER_MSEC, &limit);
 	for (;;) {
-		raw = rd(reg) & mask;
-		if (raw == want) {
-			return 1;
-		}
-		/* A fault bit is set (read fault / bus fault): no point waiting for the
-		 * DONE bit until the 1 s timeout — return now so the caller logs it. */
+		raw = (__atomic_load_n(&slot_irq_bits[slot], __ATOMIC_ACQUIRE) | rd(mali + JOB_IRQ_RAWSTAT)) & mask;
 		if (raw != 0) {
-			return 0;
+			*raw_out = raw;
+			return (raw & want) == want;
 		}
 		elapsed = mach_absolute_time() - start;
 		if (elapsed >= limit) {
+			*raw_out = 0;
 			return 0;
 		}
 		absolutetime_to_nanoseconds(elapsed, &ns);
-		if (ns < 200 * NSEC_PER_USEC) {
-			/* busy-wait: delay() does not sleep the thread, so no timer-queue
-			 * wakeup latency for the sub-millisecond jobs we expect. */
-			delay(1);
-		} else if (ns < 2 * NSEC_PER_MSEC) {
-			delay(10);
-		} else {
-			delay_for_interval(200, NSEC_PER_USEC);
+		if (ns < 60 * NSEC_PER_USEC || !mali_irq_attached) {
+			delay(ns < 200 * NSEC_PER_USEC ? 1 : 10);
+			continue;
+		}
+		uint64_t rem_ns = ((uint64_t)ms * NSEC_PER_MSEC > ns) ? ((uint64_t)ms * NSEC_PER_MSEC - ns) : 1;
+		uint32_t rem_us = (uint32_t)(rem_ns / NSEC_PER_USEC);
+		if (rem_us == 0) {
+			rem_us = 1;
+		}
+		assert_wait_timeout((event_t)&slot_irq_bits[slot], THREAD_UNINT, rem_us, NSEC_PER_USEC);
+		raw = (__atomic_load_n(&slot_irq_bits[slot], __ATOMIC_ACQUIRE) | rd(mali + JOB_IRQ_RAWSTAT)) & mask;
+		if (raw != 0) {
+			clear_wait(current_thread(), THREAD_AWAKENED);
+			*raw_out = raw;
+			return (raw & want) == want;
+		}
+		wait_result_t wres = thread_block(THREAD_CONTINUE_NULL);
+		raw = (__atomic_load_n(&slot_irq_bits[slot], __ATOMIC_ACQUIRE) | rd(mali + JOB_IRQ_RAWSTAT)) & mask;
+		if (raw != 0) {
+			*raw_out = raw;
+			return (raw & want) == want;
+		}
+		if (wres == THREAD_TIMED_OUT) {
+			*raw_out = 0;
+			return 0;
 		}
 	}
 }
@@ -926,23 +971,21 @@ hakios_mali_parameter(uint32_t which, uint64_t * value)
  * One job chain, from GPU address `chain`, run to its end before this returns. 0 when it
  * finished; otherwise the slot's status, or 0xff when it did not answer within a second.
  */
-uint32_t
-hakios_mali_submit(uint64_t chain, bool fragment)
+static uint64_t
+mali_start_slot(uint32_t slot, uint64_t chain)
 {
-	uint32_t slot = fragment ? 0 : 1;
 	uint64_t js = mali + JS_BASE(slot);
-	uint32_t raw, status = 0;
-	bool finished;
+	static int cfg_logged;
 
-	lck_mtx_lock(&mali_job_lock);
+	lck_mtx_lock(&mali_slot_lock[slot]);
 	lck_mtx_lock(&mali_lock);
 	wr(mali + JOB_IRQ_CLEAR, JOB_IRQ_DONE(slot) | JOB_IRQ_FAILED(slot));
+	__atomic_store_n(&slot_irq_bits[slot], 0, __ATOMIC_SEQ_CST);
 	wr(js + JS_HEAD_NEXT_LO, (uint32_t)chain);
 	wr(js + JS_HEAD_NEXT_HI, (uint32_t)(chain >> 32));
 	wr(js + JS_AFFINITY_NEXT_LO, shader_mask);
 	wr(js + JS_AFFINITY_NEXT_HI, 0);
 	{
-		static int cfg_logged;
 		/* START_MMU (bit 10) deliberately clear: the working G57 driver does not
 		 * set it; the MMU is per-AS. Log written vs readback once to check that
 		 * THREAD_PRI(8) (0x80000) is not being dropped by the hardware. */
@@ -963,11 +1006,20 @@ hakios_mali_submit(uint64_t chain, bool fragment)
 	asm volatile("dsb sy\n" ::: "memory");
 	wr(js + JS_COMMAND_NEXT, JS_COMMAND_START);
 	lck_mtx_unlock(&mali_lock);
+	return mach_absolute_time();
+}
 
-	finished = mali_wait_job(mali + JOB_IRQ_RAWSTAT, JOB_IRQ_DONE(slot) | JOB_IRQ_FAILED(slot),
-	    JOB_IRQ_DONE(slot), 1000);
+static uint32_t
+mali_finish_slot(uint32_t slot, uint64_t tGpu)
+{
+	uint64_t js = mali + JS_BASE(slot);
+	uint64_t gpuNs, us;
+	uint32_t raw, status = 0;
+	bool finished;
+
+	finished = mali_wait_slot(slot, 1000, &raw);
 	lck_mtx_lock(&mali_lock);
-	raw = rd(mali + JOB_IRQ_RAWSTAT);
+	raw |= rd(mali + JOB_IRQ_RAWSTAT);
 	if (!finished || (raw & JOB_IRQ_FAILED(slot))) {
 		uint32_t as_base = AS_BASE(GPU_AS_NUMBER);
 		uint32_t fault_stat = rd(mali + as_base + AS_FAULTSTATUS);
@@ -1020,10 +1072,191 @@ hakios_mali_submit(uint64_t chain, bool fragment)
 			wr(mali + MMU_IRQ_CLEAR, mmu_stat);
 		}
 	}
-	wr(mali + JOB_IRQ_CLEAR, raw);
+	wr(mali + JOB_IRQ_CLEAR, raw & (JOB_IRQ_DONE(slot) | JOB_IRQ_FAILED(slot)));
 	lck_mtx_unlock(&mali_lock);
-	lck_mtx_unlock(&mali_job_lock);
+	lck_mtx_unlock(&mali_slot_lock[slot]);
+	absolutetime_to_nanoseconds(mach_absolute_time() - tGpu, &gpuNs);
+	us = gpuNs / 1000;
+	__atomic_fetch_add(&gMaliGpuUs, us, __ATOMIC_RELAXED);
+	if (slot == 0) {
+		__atomic_fetch_add(&gMaliJs0Us, us, __ATOMIC_RELAXED);
+		__atomic_fetch_add(&gMaliJs0Count, 1, __ATOMIC_RELAXED);
+	} else {
+		__atomic_fetch_add(&gMaliJs1Us, us, __ATOMIC_RELAXED);
+		__atomic_fetch_add(&gMaliJs1Count, 1, __ATOMIC_RELAXED);
+	}
 	return status;
+}
+
+uint32_t
+hakios_mali_submit(uint64_t chain, bool fragment)
+{
+	uint32_t slot = fragment ? 0 : 1;
+	return mali_finish_slot(slot, mali_start_slot(slot, chain));
+}
+
+/*
+ * Async job queue: submits return a monotonic sequence number immediately while
+ * mali_worker() drains the chain in exact FIFO order via JS0/JS1 + JOB_IRQ.
+ * When consecutive paired batches use distinct tiler heaps (heap_tag), JS1 of
+ * batch N+1 overlaps on slot 1 while JS0 of batch N runs on slot 0.
+ */
+#define MALI_QUEUE      64
+struct mali_queue_item {
+	uint64_t chain, chain2, seq;
+	uint32_t heap_tag;
+	bool fragment;
+};
+static struct mali_queue_item mali_queue[MALI_QUEUE];
+static unsigned mali_queue_head, mali_queue_count;
+static uint64_t mali_queued_seq, mali_done_seq;
+static bool mali_worker_started;
+static LCK_MTX_DECLARE(mali_queue_lock, &mali_lck_grp);
+
+static void
+mali_worker(__unused void *parameter, __unused wait_result_t result)
+{
+	bool have_prefetched = false;
+	struct mali_queue_item prefetched = { 0 };
+	uint64_t prefetched_tGpu = 0;
+
+	for (;;) {
+		struct mali_queue_item cur;
+
+		if (have_prefetched) {
+			cur = prefetched;
+			have_prefetched = false;
+			(void)mali_finish_slot(1, prefetched_tGpu);
+		} else {
+			lck_mtx_lock(&mali_queue_lock);
+			while (mali_queue_count == 0) {
+				lck_mtx_sleep(&mali_queue_lock, LCK_SLEEP_DEFAULT, (event_t)&mali_queue_count, THREAD_UNINT);
+			}
+			cur = mali_queue[mali_queue_head];
+			lck_mtx_unlock(&mali_queue_lock);
+
+			if (cur.chain2 != 0) {
+				(void)mali_finish_slot(1, mali_start_slot(1, cur.chain));
+			} else {
+				(void)hakios_mali_submit(cur.chain, cur.fragment);
+				goto retire;
+			}
+		}
+
+		{
+			uint64_t tFrag = mali_start_slot(0, cur.chain2);
+
+			if (gMaliPipe && cur.heap_tag != 0) {
+				lck_mtx_lock(&mali_queue_lock);
+				if (mali_queue_count >= 2) {
+					unsigned next_idx = (mali_queue_head + 1) % MALI_QUEUE;
+					struct mali_queue_item next = mali_queue[next_idx];
+
+					if (next.chain2 != 0 && next.heap_tag != 0 && next.heap_tag != cur.heap_tag) {
+						prefetched = next;
+						have_prefetched = true;
+						__atomic_fetch_add(&gMaliPipelined, 1, __ATOMIC_RELAXED);
+					}
+				}
+				lck_mtx_unlock(&mali_queue_lock);
+				if (have_prefetched) {
+					prefetched_tGpu = mali_start_slot(1, prefetched.chain);
+				}
+			}
+			(void)mali_finish_slot(0, tFrag);
+		}
+
+retire:
+		lck_mtx_lock(&mali_queue_lock);
+		mali_queue_head = (mali_queue_head + 1) % MALI_QUEUE;
+		mali_queue_count--;
+		__atomic_store_n(&mali_done_seq, cur.seq, __ATOMIC_RELEASE);
+		lck_mtx_unlock(&mali_queue_lock);
+		wakeup((caddr_t)&mali_done_seq);
+		wakeup((caddr_t)&mali_queue_head);
+	}
+}
+
+static uint64_t
+mali_enqueue_common(uint64_t chain, uint64_t chain2, uint32_t heap_tag, bool fragment)
+{
+	uint64_t seq;
+
+	lck_mtx_lock(&mali_queue_lock);
+	if (!mali_worker_started) {
+		extern kern_return_t kernel_thread_start_priority(thread_continue_t continuation, void *parameter,
+		    integer_t priority, thread_t *new_thread);
+		thread_t thread;
+
+		if (kernel_thread_start_priority(mali_worker, NULL, 93, &thread) == KERN_SUCCESS) {
+			thread_set_thread_name(thread, "the Mali's jobs");
+			thread_deallocate(thread);
+			mali_worker_started = true;
+		}
+	}
+	while (mali_queue_count == MALI_QUEUE) {
+		lck_mtx_sleep(&mali_queue_lock, LCK_SLEEP_DEFAULT, (event_t)&mali_queue_head, THREAD_UNINT);
+	}
+	seq = ++mali_queued_seq;
+	unsigned at = (mali_queue_head + mali_queue_count) % MALI_QUEUE;
+
+	mali_queue[at].chain = chain;
+	mali_queue[at].chain2 = chain2;
+	mali_queue[at].heap_tag = heap_tag;
+	mali_queue[at].fragment = fragment;
+	mali_queue[at].seq = seq;
+	mali_queue_count++;
+	lck_mtx_unlock(&mali_queue_lock);
+	wakeup((caddr_t)&mali_queue_count);
+	return seq;
+}
+
+uint64_t hakios_mali_enqueue(uint64_t chain, bool fragment);
+uint64_t
+hakios_mali_enqueue(uint64_t chain, bool fragment)
+{
+	return mali_enqueue_common(chain, 0, 0, fragment);
+}
+
+uint64_t hakios_mali_enqueue_pair(uint64_t chain, uint64_t chain2, uint32_t heap_tag);
+uint64_t
+hakios_mali_enqueue_pair(uint64_t chain, uint64_t chain2, uint32_t heap_tag)
+{
+	return mali_enqueue_common(chain, chain2, heap_tag, false);
+}
+
+bool hakios_mali_wait(uint64_t seq, uint64_t timeout_ns);
+bool
+hakios_mali_wait(uint64_t seq, uint64_t timeout_ns)
+{
+	uint64_t deadline;
+	bool done;
+
+	if (seq <= __atomic_load_n(&mali_done_seq, __ATOMIC_ACQUIRE)) {
+		return true;
+	}
+	if (timeout_ns == 0) {
+		return false;
+	}
+	if (timeout_ns > 10ull * NSEC_PER_SEC) {
+		timeout_ns = 10ull * NSEC_PER_SEC;
+	}
+	nanoseconds_to_absolutetime(timeout_ns, &deadline);
+	deadline += mach_absolute_time();
+	lck_mtx_lock(&mali_queue_lock);
+	while (mali_done_seq < seq && mach_absolute_time() < deadline) {
+		lck_mtx_sleep_deadline(&mali_queue_lock, LCK_SLEEP_DEFAULT, (event_t)&mali_done_seq, THREAD_UNINT, deadline);
+	}
+	done = mali_done_seq >= seq;
+	lck_mtx_unlock(&mali_queue_lock);
+	return done;
+}
+
+uint64_t hakios_mali_done_seq(void);
+uint64_t
+hakios_mali_done_seq(void)
+{
+	return __atomic_load_n(&mali_done_seq, __ATOMIC_ACQUIRE);
 }
 
 /* ---- the bring-up ---- */
@@ -1163,8 +1396,11 @@ hakios_mali_init(void)
 	}
 	(void)PE_parse_boot_argn("mali_lkrails", &lkrails, sizeof(lkrails));
 	(void)PE_parse_boot_argn("mali_clk", &mali_clk_mode, sizeof(mali_clk_mode));
+	(void)PE_parse_boot_argn("mali_irq", &mali_irq_enable, sizeof(mali_irq_enable));
+	(void)PE_parse_boot_argn("mali_pipe", &gMaliPipe, sizeof(gMaliPipe));
 	lck_mtx_init(&mali_lock, &mali_lck_grp, LCK_ATTR_NULL);
-	lck_mtx_init(&mali_job_lock, &mali_lck_grp, LCK_ATTR_NULL);
+	lck_mtx_init(&mali_slot_lock[0], &mali_lck_grp, LCK_ATTR_NULL);
+	lck_mtx_init(&mali_slot_lock[1], &mali_lck_grp, LCK_ATTR_NULL);
 	lck_mtx_init(&kept_lock, &mali_lck_grp, LCK_ATTR_NULL);
 
 	topckgen = ml_io_map(TOPCKGEN_BASE, 0x1000);
@@ -1292,11 +1528,26 @@ hakios_mali_init(void)
 	pt_set_count(pt_top, 1);
 	FlushPoC_DcacheRegion((vm_offset_t)pt_top, PAGE_SIZE);
 	as_program(pt_top_phys);
+	if (mali_irq_enable) {
+		wr(mali + JOB_IRQ_CLEAR, 0xffffffffu);
+		wr(mali + JOB_IRQ_MASK, MALI_JOB_IRQ_MASK);
+		kern_return_t kr = gic_v3_spi_attach(MALI_JOB_SPI, false, mali_job_irq, NULL);
+		mali_irq_attached = (kr == KERN_SUCCESS);
+		printf("mali: JOB_IRQ SPI %u attach %s (kr=%d, mask=%#x)\n",
+		    MALI_JOB_SPI, mali_irq_attached ? "OK" : "FAILED", kr, rd(mali + JOB_IRQ_MASK));
+	}
 	reached = 6;
 
 done:
 	printf("mali: the GPU is up; the service HakiosPanfrostGPU is for programs to draw with\n");
 	HakiosMaliStart();
+	/* vivagpu=N publishes the vgpu UAPI service for the prebuilt VivaMTLDriver.bundle */
+	{
+		int vivagpu = 0;
+		if (PE_parse_boot_argn("vivagpu", &vivagpu, sizeof(vivagpu)) && vivagpu != 0) {
+			HakiosVivaGPUStart();
+		}
+	}
 	return;
 
 off:

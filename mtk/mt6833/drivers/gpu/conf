@@ -4,6 +4,8 @@
 driver MT6833_MALI
 	file    bsd/dev/hakios.mt6833_mali.c
 	file    iokit/Kernel/hakios.mt6833_mali.cpp iokitcpp
+	file    iokit/Kernel/hakios.viva_gpu.cpp iokitcpp
 	default n
 	help    MediaTek MT6833 (Dimensity 700) Mali-G57 MC2 Valhall GPU (mali=1): power, clocks, MMU,
 	help    jobs; HakiosPanfrostGPU, panfrost's DRM interface as an IOKit service for Mesa
+	help    VivaGPUAccelerator, the vgpu UAPI for the prebuilt VivaMTLDriver Metal plug-in (vivagpu=1)

@@ -39,13 +39,31 @@ bool hakios_mali_map(uint64_t gpu, uint64_t phys);
 void hakios_mali_mapped(void);
 void hakios_mali_unmap(uint64_t gpu, uint64_t size);
 uint32_t hakios_mali_submit(uint64_t chain, bool fragment);
+uint64_t hakios_mali_enqueue(uint64_t chain, bool fragment);
+uint64_t hakios_mali_enqueue_pair(uint64_t chain, uint64_t chain2, uint32_t heap_tag);
+bool hakios_mali_wait(uint64_t seq, uint64_t timeout_ns);
+uint64_t hakios_mali_done_seq(void);
 
 void HakiosMaliStart(void);
 void MiniIOMobileFramebufferShow(const uint8_t * pixels, uint32_t width, uint32_t height, uint32_t rowBytes);
 
 uint32_t gMaliClients, gMaliBuffers, gMaliSubmits, gMaliFailed;
+uint64_t gMaliGpuUs, gMaliJs0Us, gMaliJs1Us, gMaliJs0Count, gMaliJs1Count, gMaliPipelined;
 struct hakios_mali_made { uint64_t address, size; uint32_t asked, flags; };
 struct hakios_mali_made gMaliMade[32];
+}
+
+/* Display/IOSurface wait for asynchronous Mali jobs targeting this surface. */
+bool
+hakios_mali_surface_drawn(MiniIOSurface * surface, uint64_t milliseconds)
+{
+	if (surface == NULL || surface->maliSeq == 0) {
+		return true;
+	}
+	if (surface->maliSeq == ~0ull) {
+		return false;
+	}
+	return hakios_mali_wait(surface->maliSeq, milliseconds * NSEC_PER_MSEC);
 }
 
 /* Linux's include/uapi/drm/panfrost_drm.h and drm.h: the requests' numbers and structures. */
@@ -58,8 +76,23 @@ enum {
 	kPanfrostGetParam       = 0x44,
 	kPanfrostGetBOOffset    = 0x45,
 	kPanfrostMadvise        = 0x48,
+	kHakiosSubmitPair       = 0x7c,
+	kHakiosWait             = 0x7d,
 	kHakiosSurface          = 0x7e,
 	kHakiosShow             = 0x7f,
+};
+
+struct hakios_submit_pair {
+	uint64_t jc;
+	uint64_t frag_jc;
+	uint64_t bo_handles;
+	uint32_t bo_handle_count;
+	uint32_t requirements;
+};
+
+struct hakios_wait {
+	uint64_t seq;
+	int64_t timeout_ns;
 };
 
 struct hakios_show {
@@ -127,7 +160,7 @@ struct drm_panfrost_madvise {
 struct mali_buffer {
 	IOMemoryDescriptor * memory;
 	MiniIOSurface * surface;
-	uint64_t address, size;
+	uint64_t address, size, last_seq;
 	uint32_t flags;                  /* drm_panfrost_create_bo flags (value 2 = BO_HEAP) */
 };
 
@@ -193,6 +226,8 @@ class HakiosPanfrostGPUUserClient : public IOUserClient
 
 	struct mali_buffer * buffer(uint32_t handle);
 	void freeBuffer(struct mali_buffer * b);
+	void logSubmitDesc(uint64_t jc);
+	void markSubmittedBOs(uint64_t boHandles, uint32_t count, uint64_t seq);
 	IOReturn createBO(struct drm_panfrost_create_bo * request);
 	struct mali_buffer * newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t * handle, uint64_t align = 0);
 	IOReturn surfaceBuffer(struct hakios_surface * request);
@@ -231,10 +266,13 @@ HakiosPanfrostGPUUserClient::buffer(uint32_t handle)
 	return &fBuffers[handle - 1];
 }
 
-/* With the lock held. No job can still be using it: every job has finished before its call returned. */
+/* With the lock held. Wait for queued/running jobs on this buffer before unmapping. */
 void
 HakiosPanfrostGPUUserClient::freeBuffer(struct mali_buffer * b)
 {
+	if (b->last_seq != 0) {
+		(void)hakios_mali_wait(b->last_seq, 2ull * NSEC_PER_SEC);
+	}
 	hakios_mali_unmap(b->address, b->size);
 	if (b->surface != NULL) {
 		MiniIOSurfaceDrop(b->surface);
@@ -336,8 +374,10 @@ HakiosPanfrostGPUUserClient::createBO(struct drm_panfrost_create_bo * request)
 	if (request->handle <= 32) {
 		gMaliMade[request->handle - 1] = (struct hakios_mali_made) { b->address, size, request->size, request->flags };
 	}
-	IOLog("HakiosPanfrostGPU: BO #%u created: addr %#llx..%#llx (size %llu, asked %u, flags %#x)\n",
-	    request->handle, b->address, b->address + size, size, request->size, request->flags);
+	if (gMaliBuffers <= 32) {
+		IOLog("HakiosPanfrostGPU: BO #%u created: addr %#llx..%#llx (size %llu, asked %u, flags %#x)\n",
+		    request->handle, b->address, b->address + size, size, request->size, request->flags);
+	}
 	return kIOReturnSuccess;
 }
 
@@ -399,8 +439,10 @@ HakiosPanfrostGPUUserClient::surfaceBuffer(struct hakios_surface * request)
 	if (request->handle <= 32) {
 		gMaliMade[request->handle - 1] = (struct hakios_mali_made) { b->address, size, (uint32_t)size, 0x7e };
 	}
-	IOLog("HakiosPanfrostGPU: Surface BO #%u created: addr %#llx..%#llx (size %llu)\n",
-	    request->handle, b->address, b->address + size, size);
+	if (gMaliBuffers <= 32) {
+		IOLog("HakiosPanfrostGPU: Surface BO #%u created: addr %#llx..%#llx (size %llu)\n",
+		    request->handle, b->address, b->address + size, size);
+	}
 	return kIOReturnSuccess;
 }
 
@@ -478,6 +520,56 @@ HakiosPanfrostGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits * opt
 	return ret;
 }
 
+void
+HakiosPanfrostGPUUserClient::logSubmitDesc(uint64_t jc)
+{
+	struct mali_buffer * jc_b = NULL;
+
+	for (uint32_t i = 0; i < MALI_BUFFERS; i++) {
+		if (fBuffers[i].memory != NULL &&
+		    jc >= fBuffers[i].address &&
+		    jc < fBuffers[i].address + fBuffers[i].size) {
+			jc_b = &fBuffers[i];
+			break;
+		}
+	}
+	if (jc_b != NULL && jc_b->surface == NULL) {
+		uint32_t * w = (uint32_t *)((uint8_t *)((IOBufferMemoryDescriptor *)jc_b->memory)->getBytesNoCopy() +
+		                            (jc - jc_b->address));
+		uint64_t avgGpu = gMaliSubmits ? (__atomic_load_n(&gMaliGpuUs, __ATOMIC_RELAXED) / gMaliSubmits) : 0;
+		uint64_t c0 = __atomic_load_n(&gMaliJs0Count, __ATOMIC_RELAXED);
+		uint64_t c1 = __atomic_load_n(&gMaliJs1Count, __ATOMIC_RELAXED);
+		uint64_t avg0 = c0 ? (__atomic_load_n(&gMaliJs0Us, __ATOMIC_RELAXED) / c0) : 0;
+		uint64_t avg1 = c1 ? (__atomic_load_n(&gMaliJs1Us, __ATOMIC_RELAXED) / c1) : 0;
+		uint64_t piped = __atomic_load_n(&gMaliPipelined, __ATOMIC_RELAXED);
+		IOLog("HakiosPanfrostGPU: submit #%u (total=%u failed=%u avg_gpu=%llu us js1=%llu us js0=%llu us pipe=%llu) jc=%#llx desc=[%#x, %#x, %#x, %#x, %#x, %#x, %#x, %#x]\n",
+		    fSubmits, gMaliSubmits, gMaliFailed, avgGpu, avg1, avg0, piped,
+		    jc, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+	}
+}
+
+void
+HakiosPanfrostGPUUserClient::markSubmittedBOs(uint64_t boHandles, uint32_t count, uint64_t seq)
+{
+	for (uint32_t i = 0; seq != 0 && i < count && i < 4096; i += 64) {
+		uint32_t handles[64];
+		uint32_t n = count - i < 64 ? count - i : 64;
+
+		if (copyin((user_addr_t) (boHandles + i * sizeof(uint32_t)), handles, n * sizeof(uint32_t)) != 0) {
+			break;
+		}
+		for (uint32_t k = 0; k < n; k++) {
+			struct mali_buffer * b = buffer(handles[k]);
+			if (b != NULL) {
+				b->last_seq = seq;
+				if (b->surface != NULL) {
+					b->surface->maliSeq = seq;
+				}
+			}
+		}
+	}
+}
+
 IOReturn
 HakiosPanfrostGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments * args,
     IOExternalMethodDispatch * dispatch, OSObject * target, void * reference)
@@ -485,6 +577,7 @@ HakiosPanfrostGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodA
 	union {
 		struct drm_gem_close close;
 		struct drm_panfrost_submit submit;
+		struct hakios_submit_pair pair;
 		struct drm_panfrost_wait_bo wait;
 		struct drm_panfrost_create_bo create;
 		struct drm_panfrost_mmap_bo mmap;
@@ -493,6 +586,7 @@ HakiosPanfrostGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodA
 		struct drm_panfrost_madvise madvise;
 		struct hakios_surface surface;
 		struct hakios_show show;
+		struct hakios_wait waitseq;
 	} r;
 	size_t size = args->structureInputSize;
 	struct mali_buffer * b;
@@ -506,6 +600,33 @@ HakiosPanfrostGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodA
 	}
 	bzero(&r, sizeof(r));
 	memcpy(&r, args->structureInput, size);
+
+	if (selector == kHakiosWait || selector == kPanfrostWaitBO) {
+		uint64_t seq = r.waitseq.seq;
+		int64_t timeout = r.waitseq.timeout_ns;
+
+		if (selector == kPanfrostWaitBO) {
+			IOLockLock(gMaliLock);
+			b = buffer(r.wait.handle);
+			seq = b != NULL ? b->last_seq : 0;
+			IOLockUnlock(gMaliLock);
+			if (b == NULL) {
+				return kIOReturnNotFound;
+			}
+			timeout = r.wait.timeout_ns;
+		}
+		if (seq != 0 && !hakios_mali_wait(seq, timeout > 0 ? (uint64_t)timeout : 0)) {
+			ret = timeout <= 0 ? kIOReturnBusy : kIOReturnTimeout;
+		}
+		if (selector == kPanfrostWaitBO) {
+			r.wait.timeout_ns = (int64_t)hakios_mali_done_seq();
+		}
+		if (args->structureOutput != NULL && args->structureOutputSize >= size) {
+			memcpy(args->structureOutput, &r, size);
+			args->structureOutputSize = (uint32_t) size;
+		}
+		return ret;
+	}
 
 	IOLockLock(gMaliLock);
 	if (fRequests++ < 32) {                 /* the first ones a client makes, for following it from the log */
@@ -536,138 +657,37 @@ HakiosPanfrostGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodA
 		r.offset.offset = b != NULL ? b->address : 0;
 		break;
 	case kPanfrostSubmit: {
-		uint32_t status = 0;
-		uint64_t tFlush = mach_absolute_time(), tGpu;
+		uint64_t seq = 0;
 
 		fSubmits++;
 		gMaliSubmits++;
-
-		/*
-		 * Every buffer the chain names: flush CPU cache to PoC/RAM before submitting
-		 * so the GPU reads the descriptors and vertex data rather than stale cache lines.
-		 */
-		for (uint32_t i = 0; r.submit.jc != 0 && i < r.submit.bo_handle_count && i < 4096; i += 64) {
-			uint32_t handles[64];
-			uint32_t n = r.submit.bo_handle_count - i < 64 ? r.submit.bo_handle_count - i : 64;
-
-			if (copyin((user_addr_t) (r.submit.bo_handles + i * sizeof(uint32_t)), handles, n * sizeof(uint32_t)) != 0) {
-				break;
-			}
-			for (uint32_t k = 0; k < n; k++) {
-				b = buffer(handles[k]);
-				/* B2.4: non-surface BOs are now matched WC (see createBO/clientMemoryForType).
-				 * WC CPU writes are ordered by the dsb sy before JS_COMMAND_START, so no
-				 * per-BO FlushPoC_DcacheRegion is needed (was ~676 us/submit). The tiler
-				 * HEAP BO (flags & 2) is GPU-only scratch and was already skipped in B1. */
-				(void)b;   /* keep validating handles; no cache maintenance for WC BOs */
-			}
-		}
-		/* B2.2: how long the per-BO PoC flush loop took (us). */
-		{
-			uint64_t ns;
-			absolutetime_to_nanoseconds(mach_absolute_time() - tFlush, &ns);
-			fFlushTotal += ns / 1000;
-		}
-
-		struct mali_buffer * jc_b = NULL;
-		uint32_t * w = NULL;
 		if (r.submit.jc != 0) {
-			for (uint32_t i = 0; i < MALI_BUFFERS; i++) {
-				if (fBuffers[i].memory != NULL &&
-				    r.submit.jc >= fBuffers[i].address &&
-				    r.submit.jc < fBuffers[i].address + fBuffers[i].size) {
-					jc_b = &fBuffers[i];
-					break;
-				}
+			if (fSubmits <= 5 || (fSubmits % 20000) == 0) {
+				logSubmitDesc(r.submit.jc);
 			}
-			if (jc_b != NULL && jc_b->surface == NULL) {
-				w = (uint32_t *)((uint8_t *)((IOBufferMemoryDescriptor *)jc_b->memory)->getBytesNoCopy() +
-				               (r.submit.jc - jc_b->address));
-				/* Log the first few chains AND every 200th submit, so the count
-				 * survives even when pstore drops the middle of the log. */
-				if (fSubmits <= 5 || (fSubmits % 200) == 0) {
-					IOLog("HakiosPanfrostGPU: submit #%u (total=%u failed=%u avg_flush=%u us avg_gpu=%u us) jc=%#llx desc=[%#x, %#x, %#x, %#x, %#x, %#x, %#x, %#x]\n",
-					    fSubmits, gMaliSubmits, fFailed,
-					    (uint32_t)(fFlushTotal / fSubmits), (uint32_t)(fGpuTotal / fSubmits),
-					    r.submit.jc, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
-				}
-			}
+			asm volatile("dsb sy\n" ::: "memory");
+			seq = hakios_mali_enqueue(r.submit.jc, (r.submit.requirements & PANFROST_JD_REQ_FS) != 0);
 		}
+		markSubmittedBOs(r.submit.bo_handles, r.submit.bo_handle_count, seq);
+		r.submit.jc = seq;
+		r.submit.in_syncs = hakios_mali_done_seq();
+		break;
+	}
+	case kHakiosSubmitPair: {
+		uint64_t seq = 0;
 
-		asm volatile("dsb sy\n" ::: "memory");
-
-		if (r.submit.jc != 0) {
-			tGpu = mach_absolute_time();
-			status = hakios_mali_submit(r.submit.jc, r.submit.requirements & PANFROST_JD_REQ_FS);
-			/* B2.2: how long the synchronous GPU submit took (us). */
-			{
-				uint64_t ns;
-				absolutetime_to_nanoseconds(mach_absolute_time() - tGpu, &ns);
-				fGpuTotal += ns / 1000;
+		fSubmits++;
+		gMaliSubmits += 2;
+		if (r.pair.jc != 0 && r.pair.frag_jc != 0) {
+			if (fSubmits <= 5 || (fSubmits % 20000) == 0) {
+				logSubmitDesc(r.pair.jc);
 			}
+			asm volatile("dsb sy\n" ::: "memory");
+			seq = hakios_mali_enqueue_pair(r.pair.jc, r.pair.frag_jc, (r.pair.requirements >> 8) & 0xffu);
 		}
-		if (status != 0) {
-			fFailed++;
-			ret = kIOReturnError;
-			if (jc_b != NULL && w != NULL && fFailed <= 10) {
-				FlushPoC_DcacheRegion((vm_offset_t)((IOBufferMemoryDescriptor *)jc_b->memory)->getBytesNoCopy(), (size_t)jc_b->size);
-				IOLog("HakiosPanfrostGPU: FAIL jc=%#llx desc_after=[%#x, %#x, %#x, %#x, %#x, %#x, %#x, %#x]\n",
-				    r.submit.jc, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
-				IOLog("HakiosPanfrostGPU: FAIL desc_ext=[%#x, %#x, %#x, %#x, %#x, %#x, %#x, %#x]\n",
-				    w[8], w[9], w[10], w[11], w[12], w[13], w[14], w[15]);
-				/* G57 0x58 diagnosis: dump the whole MALLOC_VERTEX job (96 words / 384 bytes).
-				 * The DRAW section (shader + attribute pointers) is words 32-63, beyond the
-				 * old 32-word dump — that is the likely home of the invalid field the GPU
-				 * rejects. Bound by the words actually left in the BO at the jc offset. */
-				uint64_t jc_off = r.submit.jc - jc_b->address;
-				uint32_t avail_words = jc_b->size > jc_off ? (uint32_t)((jc_b->size - jc_off) / 4) : 0;
-				if (avail_words > 96) {
-					avail_words = 96;
-				}
-				for (uint32_t j = 16; j < avail_words; j += 8) {
-					IOLog("HakiosPanfrostGPU: FAIL job[%u..%u]=[%#x, %#x, %#x, %#x, %#x, %#x, %#x, %#x]\n",
-					    j, j + 7, w[j], w[j + 1], w[j + 2], w[j + 3], w[j + 4], w[j + 5], w[j + 6], w[j + 7]);
-				}
-				uint64_t tiler_ptr = ((uint64_t)w[15] << 32) | w[14];
-				if (tiler_ptr != 0) {
-					struct mali_buffer * tb = NULL;
-					for (uint32_t i = 0; i < MALI_BUFFERS; i++) {
-						if (fBuffers[i].memory != NULL &&
-						    tiler_ptr >= fBuffers[i].address &&
-						    tiler_ptr < fBuffers[i].address + fBuffers[i].size) {
-							tb = &fBuffers[i];
-							break;
-						}
-					}
-					if (tb != NULL && tb->surface == NULL) {
-						FlushPoC_DcacheRegion((vm_offset_t)((IOBufferMemoryDescriptor *)tb->memory)->getBytesNoCopy(), (size_t)tb->size);
-						uint32_t * tw = (uint32_t *)((uint8_t *)((IOBufferMemoryDescriptor *)tb->memory)->getBytesNoCopy() +
-						               (tiler_ptr - tb->address));
-						IOLog("HakiosPanfrostGPU: FAIL tiler_ctx @ %#llx = [%#x, %#x, %#x, %#x, %#x, %#x, %#x, %#x]\n",
-						    tiler_ptr, tw[0], tw[1], tw[2], tw[3], tw[4], tw[5], tw[6], tw[7]);
-						uint64_t heap_ptr = ((uint64_t)tw[7] << 32) | tw[6];
-						if (heap_ptr != 0) {
-							struct mali_buffer * hb = NULL;
-							for (uint32_t i = 0; i < MALI_BUFFERS; i++) {
-								if (fBuffers[i].memory != NULL &&
-								    heap_ptr >= fBuffers[i].address &&
-								    heap_ptr < fBuffers[i].address + fBuffers[i].size) {
-									hb = &fBuffers[i];
-									break;
-								}
-							}
-							if (hb != NULL && hb->surface == NULL) {
-								FlushPoC_DcacheRegion((vm_offset_t)((IOBufferMemoryDescriptor *)hb->memory)->getBytesNoCopy(), (size_t)hb->size);
-								uint32_t * hw = (uint32_t *)((uint8_t *)((IOBufferMemoryDescriptor *)hb->memory)->getBytesNoCopy() +
-								               (heap_ptr - hb->address));
-								IOLog("HakiosPanfrostGPU: FAIL tiler_heap @ %#llx = [%#x, %#x, %#x, %#x, %#x, %#x, %#x, %#x]\n",
-								    heap_ptr, hw[0], hw[1], hw[2], hw[3], hw[4], hw[5], hw[6], hw[7]);
-							}
-						}
-					}
-				}
-			}
-		}
+		markSubmittedBOs(r.pair.bo_handles, r.pair.bo_handle_count, seq);
+		r.pair.jc = seq;
+		r.pair.frag_jc = hakios_mali_done_seq();
 		break;
 	}
 	case kPanfrostWaitBO:                   /* every job has finished before its submission returned */

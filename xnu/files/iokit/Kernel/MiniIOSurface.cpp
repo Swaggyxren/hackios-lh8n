@@ -156,6 +156,11 @@ static thread_call_t    gSurfaceClearing;
 static uint32_t         gSurfacesGivenAgain;    /* for MiniIOSurfaceCost() */
 /* boot-arg surf_clear=0: kept memory is given out as it is (to see what the clearing costs; a surface is then not all zeroes) */
 static TUNABLE(uint32_t, gSurfaceClear, "surf_clear", 1);
+/* boot-arg surf_wrap=0: surfaces around the client's pictures refused, as before methodWrapClientImage (for comparing) */
+static TUNABLE(uint32_t, gSurfaceWrap, "surf_wrap", 1);
+static TUNABLE(uint32_t, gSurfaceContig, "surf_contig", 1);
+
+extern "C" void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
 
 void
 MiniIOSurfaceClearKept(void)
@@ -173,6 +178,7 @@ MiniIOSurfaceClearKept(void)
 		gSurfaceKept[i].busy = true;
 		IOLockUnlock(gSurfaceKeptLock);
 		bzero(memory->getBytesNoCopy(), memory->getCapacity());
+		FlushPoC_DcacheRegion((vm_offset_t) memory->getBytesNoCopy(), memory->getCapacity());
 		IOLockLock(gSurfaceKeptLock);
 		gSurfaceKept[i].busy = false;
 		gSurfaceKept[i].clear = true;
@@ -209,8 +215,16 @@ surfaceMemory(vm_size_t bytes)
 		gSurfacesGivenAgain += memory != NULL;
 		IOLockUnlock(gSurfaceKeptLock);
 		if (memory != NULL && !clear) {
-			bzero(memory->getBytesNoCopy(), gSurfaceClear ? bytes : PAGE_SIZE);
+			size_t clearLen = gSurfaceClear ? bytes : PAGE_SIZE;
+
+			bzero(memory->getBytesNoCopy(), clearLen);
+			FlushPoC_DcacheRegion((vm_offset_t) memory->getBytesNoCopy(), clearLen);
 		}
+	}
+	if (memory == NULL && gSurfaceContig && bytes >= (8ull << 20)) {
+		memory = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+		    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous,
+		    bytes, 0x00000000ffffc000ULL);
 	}
 	if (memory == NULL) {
 		memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared, bytes,
@@ -617,7 +631,8 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 	needed += offset;
 	alloc = dictNumber(props, "IOSurfaceAllocSize", 0);
 	if (alloc < needed) {
-		if (alloc != 0) {
+		/* (a surface around the owner's memory has the owner's size: a mask's last row is only as long as it is wide) */
+		if (alloc != 0 && wrapped == NULL) {
 			IOLog("MiniIOSurface: alloc size %u too small for %ux%u '%.4s', using %llu\n", alloc, width, height,
 			    (const char *) &format, needed);
 		}
@@ -932,6 +947,7 @@ class IOSurfaceRootUserClient : public IOUserClient
 
 	IOReturn methodInit(IOExternalMethodArguments * args);
 	IOReturn methodCreate(IOExternalMethodArguments * args);
+	IOReturn methodWrapClientImage(IOExternalMethodArguments * args);
 	IOReturn methodLookup(IOExternalMethodArguments * args);
 	IOReturn methodLookupFromPort(IOExternalMethodArguments * args);
 	IOReturn methodCreatePort(IOExternalMethodArguments * args);
@@ -946,7 +962,7 @@ class IOSurfaceRootUserClient : public IOUserClient
 	IOReturn trapUnlock(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
 	IOReturn trapDetach(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
 	IOReturn trapRelease(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
-	IOReturn lockCommon(uint32_t sid, uint32_t options, user_addr_t seedOut);
+	IOReturn lockCommon(uint32_t sid, uint32_t options, user_addr_t seedOut, bool waitGpu = true);
 	IOReturn useCountCommon(uint32_t sid, uint32_t category, int delta);
 
 public:
@@ -1284,6 +1300,67 @@ IOSurfaceRootUserClient::methodCreate(IOExternalMethodArguments * args)
 			all = making = mapping = 0;
 		}
 	}
+	return ret;
+}
+
+/*
+ * Upstream HakiOS 759b620: wrap a client image (IOSurfaceWrapClientImage) so CoreAnimation
+ * OpenGL ES doesn't hit ~4000 refused IOKit requests/sec and redraw textures every frame.
+ */
+IOReturn
+IOSurfaceRootUserClient::methodWrapClientImage(IOExternalMethodArguments * args)
+{
+	struct {
+		uint64_t address;
+		uint32_t width, height, format, bytesPerElement, bytesPerRow, size;
+	} request;
+	static const char * const keys[] = { "IOSurfaceWidth", "IOSurfaceHeight", "IOSurfacePixelFormat", "IOSurfaceBytesPerElement",
+		                             "IOSurfaceBytesPerRow", "IOSurfaceAllocSize" };
+	struct minisurf_client_ref * ref;
+	OSDictionary * props;
+	MiniIOSurface * s;
+	IOReturn ret = kIOReturnSuccess;
+	uint64_t began = mach_absolute_time();
+
+	if (args->structureInput == NULL || args->structureInputSize < sizeof(request)) {
+		return kIOReturnBadArgument;
+	}
+	memcpy(&request, args->structureInput, sizeof(request));
+	if (request.address == 0 || request.size == 0) {
+		return kIOReturnBadArgument;
+	}
+	props = OSDictionary::withCapacity(8);
+	OSNumber * address = OSNumber::withNumber(request.address, 64);
+	if (props == NULL || address == NULL) {
+		OSSafeReleaseNULL(address);
+		OSSafeReleaseNULL(props);
+		return kIOReturnNoMemory;
+	}
+	props->setObject("IOSurfaceAddress", address);
+	address->release();
+	const uint32_t values[] = { request.width, request.height, request.format, request.bytesPerElement, request.bytesPerRow,
+		                    request.size };
+	for (unsigned i = 0; i < sizeof(keys) / sizeof(keys[0]) && ret == kIOReturnSuccess; i++) {
+		OSNumber * n = OSNumber::withNumber(values[i], 32);
+
+		ret = n != NULL && props->setObject(keys[i], n) ? kIOReturnSuccess : kIOReturnNoMemory;
+		OSSafeReleaseNULL(n);
+	}
+	s = ret == kIOReturnSuccess ? surfaceCreate(props, &ret) : NULL;
+	props->release();
+	if (s == NULL) {
+		return ret;
+	}
+	IOLockLock(gSurfaceLock);
+	ref = addRef(s);
+	ret = ref ? returnSurface(ref, false, args) : kIOReturnNoMemory;
+	if (ref != NULL && ret != kIOReturnSuccess) {
+		dropRef(ref);
+	}
+	surfaceUnhold(s);
+	IOLockUnlock(gSurfaceLock);
+	OSAddAtomic64((SInt64) (mach_absolute_time() - began), (SInt64 *) &gSurfaceMaking);
+	OSIncrementAtomic(&gSurfacesMade);
 	return ret;
 }
 
@@ -1632,6 +1709,11 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
 		return methodInit(args);
 	case kSurfaceMethodCreate:
 		return methodCreate(args);
+	case kSurfaceMethodWrapClientImage:
+		if (gSurfaceWrap) {
+			return methodWrapClientImage(args);
+		}
+		break;
 	case kSurfaceMethodLookup:
 		return methodLookup(args);
 	case kSurfaceMethodLookupFromPort:
@@ -1794,11 +1876,11 @@ IOSurfaceRootUserClient::trapDecrementUseCount(void * p1, void * p2, void * p3, 
  * weather widget in the user's video. The same wait the display makes (MiniIOSurfaceDrawn).
  */
 IOReturn
-IOSurfaceRootUserClient::lockCommon(uint32_t sid, uint32_t options, user_addr_t seedOut)
+IOSurfaceRootUserClient::lockCommon(uint32_t sid, uint32_t options, user_addr_t seedOut, bool waitGpu)
 {
 	struct minisurf_client_ref * ref;
 	uint32_t seed = 0;
-	MiniIOSurface * drawn = gLockWaits ? MiniIOSurfaceCopy(sid) : NULL;
+	MiniIOSurface * drawn = (waitGpu && gLockWaits) ? MiniIOSurfaceCopy(sid) : NULL;
 
 	if (drawn != NULL) {
 		(void) MiniIOSurfaceDrawn(drawn, 500);
@@ -1834,7 +1916,7 @@ IOSurfaceRootUserClient::trapLock(void * p1, void * p2, void * p3, void * p4, vo
 IOReturn
 IOSurfaceRootUserClient::trapUnlock(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6)
 {
-	return lockCommon((uint32_t) (uintptr_t) p1, (uint32_t) (uintptr_t) p2, (user_addr_t) (uintptr_t) p3);
+	return lockCommon((uint32_t) (uintptr_t) p1, (uint32_t) (uintptr_t) p2, (user_addr_t) (uintptr_t) p3, false);
 }
 
 /*

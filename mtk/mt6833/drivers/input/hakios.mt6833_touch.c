@@ -862,13 +862,13 @@ static void
 mt6833_touch_thread(__unused void *param, __unused wait_result_t res)
 {
 	uint8_t report_buf[FTS_TOUCH_REPORT_LEN];
-	uint32_t poll_us = 8000;        /* ~125 Hz default poll rate */
+	uint32_t poll_us = 4000;        /* ~250 Hz default poll rate (avoids 125 Hz beat vs 120 Hz display) */
 
 	PE_parse_boot_argn("touch_poll_us", &poll_us, sizeof(poll_us));
 	PE_parse_boot_argn("touch_flip", &flip_mode, sizeof(flip_mode));
 
 	if (poll_us < 1000 || poll_us > 50000) {
-		poll_us = 8000;
+		poll_us = 4000;
 	}
 
 	log_touch("mt6833_touch: Layer 4/5 touch thread started (poll=%u us, flip=%u)\n",

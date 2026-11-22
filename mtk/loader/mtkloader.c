@@ -1107,6 +1107,13 @@ static void dt_end(struct dt_writer *w)
 
 
 /* What the iPhone's own device tree says (model, compatible, product ...), from xnuloader. */
+#ifndef XNU_DISPLAY_SCALE
+#define XNU_DISPLAY_SCALE   3
+#endif
+#ifndef XNU_ARTWORK_SUBTYPE
+#define XNU_ARTWORK_SUBTYPE 2436
+#endif
+
 static void dt_identity(struct dt_writer *w, const struct identity_prop *props, uint32_t count, const unsigned char *data)
 {
 	for (uint32_t i = 0; i < count; i++) {
@@ -1120,12 +1127,18 @@ static void dt_identity(struct dt_writer *w, const struct identity_prop *props, 
 		 * own height here, 1640, which no iPhone has: iOS takes an unknown class for a phone
 		 * with a home button, and the Control Centre came up from the bottom edge as on an
 		 * iPhone 8. The display driver reports the iPhone X's 1125 x 2436 whatever the panel,
-		 * so the class has to be the iPhone X's too.
+		 * so the class has to be the iPhone X's too (or XR 1792 when fbxr=1 fbscale=2).
 		 */
 		if (strcmp(props[i].name, "artwork-device-subtype") == 0) {
-			static const uint32_t subtype = 2436;
+			static const uint32_t subtype = XNU_ARTWORK_SUBTYPE;
 
 			dt_prop(w, props[i].name, &subtype, sizeof(subtype));
+			continue;
+		}
+		if (strcmp(props[i].name, "artwork-scale-factor") == 0) {
+			static const uint32_t scale = XNU_DISPLAY_SCALE;
+
+			dt_prop(w, props[i].name, &scale, sizeof(scale));
 			continue;
 		}
 		dt_prop(w, props[i].name, data + props[i].offset, props[i].length);
@@ -1204,7 +1217,7 @@ static uint32_t build_device_tree(uint64_t dt_pa, uint64_t rd_pa, uint64_t rd_si
 	dt_prop_u64(&w, "dram-base", XNU_PHYS_BASE);
 	dt_prop_u64(&w, "dram-size", XNU_MEM_SIZE);
 	dt_prop_u32(&w, "debug-enabled", 1);
-	dt_prop_u32(&w, "display-scale", 2);
+	dt_prop_u32(&w, "display-scale", XNU_DISPLAY_SCALE);
 	dt_prop_u32(&w, "display-rotation", 0);
 	dt_prop_str(&w, "psci-method", "smc");
 	static const uint8_t wifi_address[6] = { 0x02, 0x52, 0x44, 0x57, 0x00, 0x01 };
@@ -2604,11 +2617,11 @@ mt6833_rails_probe(void)
 }
 
 /*
- * Raise the A76 BIG-core rails to MT6833 stock OPP #4 (1993 MHz: Vproc 918.75 mV,
- * Vsram 1018.75 mV). On MT6833 the A76 pair is buck_vgpu11 (vsel 0x15b4, readback 0x15a6)
+ * Raise the A76 BIG-core rails to MT6833 stock OPP #2 (2203 MHz: Vproc 962.5 mV,
+ * Vsram 1062.5 mV). On MT6833 the A76 pair is buck_vgpu11 (vsel 0x15b4, readback 0x15a6)
  * and ldo_vsram_proc1 (vsel 0x1b44, readback 0x1e90) -- verified from /sys/class/regulator.
  * Step Vsram before Vproc at each stage, keeping (Vsram - Vproc) = 100 mV throughout.
- * Returns 1 only if readback confirms both sels >= 82 (the safety gate for the PLL bump).
+ * Returns max safe OPP level supported by readback: 2 (OPP2 >= 89), 4 (OPP4 >= 82), or 0 (1418).
  */
 #define VGPU11_VSEL     0x15b4u
 #define VSRAM_PROC1_VSEL 0x1b44u
@@ -2616,16 +2629,17 @@ mt6833_rails_probe(void)
 #define VSRAM_P1_READBACK 0x1e90u
 
 static int
-a76_rails_to_opp4(void)
+a76_rails_to_opp2(void)
 {
 	static const uint32_t steps[][2] = {
 		{ 56u, 56u },   /* step 1: Vsram 850 mV, then Vproc 750 mV */
 		{ 72u, 72u },   /* step 2: Vsram 950 mV, then Vproc 850 mV */
 		{ 83u, 83u },   /* step 3: Vsram 1018.75 mV, then Vproc 918.75 mV */
+		{ 90u, 90u },   /* step 4: Vsram 1062.5 mV, then Vproc 962.5 mV (OPP #2) */
 	};
 	uint16_t vproc = 0, vsram = 0;
 
-	for (uint32_t i = 0; i < 3; i++) {
+	for (uint32_t i = 0; i < 4; i++) {
 		if (!pwrap_rmw_sel(VSRAM_PROC1_VSEL, steps[i][0])) {
 			out("a76 rails: Vsram write failed\n");
 			return 0;
@@ -2635,21 +2649,27 @@ a76_rails_to_opp4(void)
 			out("a76 rails: Vproc write failed\n");
 			return 0;
 		}
-		dbg_delay_us(i == 2 ? 100 : 50);
+		dbg_delay_us(i == 3 ? 100 : 50);
 	}
 	/* Mandatory safety gate: read back BOTH da_vsel registers. */
 	if (!pwrap_read_ro(VGPU11_READBACK, &vproc) || !pwrap_read_ro(VSRAM_P1_READBACK, &vsram)) {
 		out("a76 rails: readback failed\n");
 		return 0;
 	}
-	out("a76 rails readback: vgpu11 sel="); out_dec(vproc & 0x7fu);
-	out(" mV="); out_dec((uint32_t)(400u + (vproc & 0x7fu) * 625u / 100u));
-	out(", vsram_proc1 sel="); out_dec((vsram >> 8) & 0x7fu);
-	out(" mV="); out_dec((uint32_t)(500u + ((vsram >> 8) & 0x7fu) * 625u / 100u));
+	uint32_t vp_sel = vproc & 0x7fu;
+	uint32_t vs_sel = (vsram >> 8) & 0x7fu;
+	out("a76 rails readback: vgpu11 sel="); out_dec(vp_sel);
+	out(" mV="); out_dec((uint32_t)(400u + vp_sel * 625u / 100u));
+	out(", vsram_proc1 sel="); out_dec(vs_sel);
+	out(" mV="); out_dec((uint32_t)(500u + vs_sel * 625u / 100u));
 	out("\n");
-	if ((vproc & 0x7fu) >= 82u && ((vsram >> 8) & 0x7fu) >= 82u) {
-		out("a76 rails: gate PASS (both sel >= 82)\n");
-		return 1;
+	if (vp_sel >= 89u && vs_sel >= 89u) {
+		out("a76 rails: gate PASS (OPP2: both sel >= 89)\n");
+		return 2;
+	}
+	if (vp_sel >= 82u && vs_sel >= 82u) {
+		out("a76 rails: gate OPP4 (both sel >= 82)\n");
+		return 4;
 	}
 	out("a76 rails: gate FAIL — falling back to safe 1418 MHz\n");
 	return 0;
@@ -2669,8 +2689,19 @@ static void big_cores_clock(void)
 	out("cpu plls before: ccipll CON0="); out_hex(cc0); out(" CON1="); out_hex(cc1);
 	out(" ("); out_dec(pll_mhz(cc1)); out(" MHz)\n");
 
-	/* Raise the A76 BIG rails to OPP #4 and gate the PLL on the readback. */
-	if (a76_rails_to_opp4()) {
+	/* Raise the A76 BIG rails to OPP #2 (or fallback to OPP #4 / 1418 MHz) on readback. */
+	int opp = a76_rails_to_opp2();
+	if (opp == 2) {
+		/* 2203 MHz: posdiv=0, PCW 0x152ec4 -> CON1 0x80152ec4. */
+		wr32(APMIXED_BASE + ARMPLL_BL0_CON1, 0x80152ec4u);
+		out("big cores (A76): ");
+		out_dec(pll_mhz(bl1));
+		out(" -> ");
+		out_dec(pll_mhz(rd32(APMIXED_BASE + ARMPLL_BL0_CON1)));
+		out(" MHz (OPP2, CON1=");
+		out_hex(rd32(APMIXED_BASE + ARMPLL_BL0_CON1));
+		out(")\n");
+	} else if (opp == 4) {
 		/* 1993 MHz: posdiv=0, PCW 0x1329d8 -> CON1 0x801329d8. */
 		wr32(APMIXED_BASE + ARMPLL_BL0_CON1, 0x801329d8u);
 		out("big cores (A76): ");

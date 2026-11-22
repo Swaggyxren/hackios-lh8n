@@ -244,13 +244,16 @@ struct image {
 	GLsizei width, height;
 };
 
+#define IMAGE_MAP_MAX   4096
+
 struct eagl {
 	void *table[SLOTS];             /* [0] is the context itself: what every entry gets as its first argument */
 	id object;                      /* the EAGLContext */
 	struct hakios_gl *gl;
 	unsigned long api;
-	struct image images[256];
-	unsigned image_count;
+	struct image *images;
+	unsigned image_count, image_cap;
+	uint16_t image_idx[IMAGE_MAP_MAX];      /* 1-based index into images[] for O(1) lookup */
 	GLuint framebuffer;             /* the one bound */
 	GLuint colour;                  /* ... and the texture that is its colour attachment (0: none, or no texture) */
 	GLuint reader;                  /* a framebuffer of ours, to read a texture back */
@@ -517,9 +520,13 @@ summary(struct eagl *e)
 
 /* ---- IOSurfaces ----------------------------------------------------------------------------------- */
 
-static struct image *
+static inline struct image *
 image_of(struct eagl *e, GLuint texture)
 {
+	if (texture != 0 && texture < IMAGE_MAP_MAX) {
+		uint16_t slot = e->image_idx[texture];
+		return slot != 0 ? &e->images[slot - 1] : NULL;
+	}
 	for (unsigned i = 0; i < e->image_count; i++) {
 		if (e->images[i].texture == texture) {
 			return &e->images[i];
@@ -534,11 +541,24 @@ image_new(struct eagl *e, GLuint texture, IOSurfaceRef surface)
 	struct image *image = image_of(e, texture);
 
 	if (image == NULL) {
-		if (e->image_count == sizeof(e->images) / sizeof(e->images[0])) {
-			say("hakios-gl: more textures with IOSurfaces than there is room for\n");
-			return NULL;
+		unsigned idx;
+
+		if (e->image_count == e->image_cap) {
+			unsigned cap = e->image_cap != 0 ? e->image_cap * 2 : 256;
+			struct image *grown = realloc(e->images, cap * sizeof(*grown));
+
+			if (grown == NULL) {
+				say("hakios-gl: out of memory growing IOSurface texture table (%u)\n", cap);
+				return NULL;
+			}
+			e->images = grown;
+			e->image_cap = cap;
 		}
-		image = &e->images[e->image_count++];
+		idx = e->image_count++;
+		image = &e->images[idx];
+		if (texture != 0 && texture < IMAGE_MAP_MAX) {
+			e->image_idx[texture] = (uint16_t)(idx + 1);
+		}
 	} else {
 		if (image->mirror != 0) {
 			glDeleteTextures(1, &image->mirror);
@@ -557,11 +577,19 @@ image_forget(struct eagl *e, GLuint texture)
 	struct image *image = image_of(e, texture);
 
 	if (image != NULL) {
+		unsigned idx = (unsigned)(image - e->images);
+
 		if (image->mirror != 0) {
 			glDeleteTextures(1, &image->mirror);
 		}
 		CFRelease(image->surface);
+		if (texture != 0 && texture < IMAGE_MAP_MAX) {
+			e->image_idx[texture] = 0;
+		}
 		*image = e->images[--e->image_count];
+		if (idx < e->image_count && image->texture != 0 && image->texture < IMAGE_MAP_MAX) {
+			e->image_idx[image->texture] = (uint16_t)(idx + 1);
+		}
 	}
 }
 
@@ -668,7 +696,7 @@ surface_shared(struct eagl *e, struct image *image)
  * change seen makes it looked at every frame again. A still picture that does change is seen at most STILL_EVERY frames
  * late (67 ms); what keeps changing, a picture a program animates, is looked at every frame.
  */
-#define STILL_LOOKS     120
+#define STILL_LOOKS     24
 #define STILL_EVERY     8
 static int still_seldom = 1;                    /* boot-arg glstill=0: every surface looked at every frame (for comparing) */
 static bool
@@ -687,11 +715,28 @@ surface_changed(struct eagl *e, struct image *image)
 		return false;
 	}
 	image->looked = e->frames + 1;
-	for (size_t at = 0; at + 8 <= size; at += 8) {
-		memcpy(&word, base + at, 8);
-		sum = (sum ^ word) * 0x9e3779b97f4a7c15ull;
-		sum ^= sum >> 29;
+	uint64_t s0 = sum, s1 = 0, s2 = 0, s3 = 0;
+	size_t at = 0;
+
+	for (; at + 32 <= size; at += 32) {
+		uint64_t w0, w1, w2, w3;
+
+		memcpy(&w0, base + at, 8);
+		memcpy(&w1, base + at + 8, 8);
+		memcpy(&w2, base + at + 16, 8);
+		memcpy(&w3, base + at + 24, 8);
+		s0 += w0;
+		s1 += w1;
+		s2 += w2;
+		s3 += w3;
 	}
+	for (; at + 8 <= size; at += 8) {
+		memcpy(&word, base + at, 8);
+		s0 += word;
+	}
+	sum = (s0 * 0x9e3779b97f4a7c15ull) ^ (s1 * 0xbf58476d1ce4e5b9ull) ^
+	    (s2 * 0x94d049bb133111ebull) ^ (s3 * 0xd6e8feb86659fd93ull);
+	sum ^= sum >> 29;
 	if (sum == image->sum) {
 		image->unchanged += image->unchanged < STILL_LOOKS;
 		return false;
@@ -777,6 +822,7 @@ surface_to_texture(struct eagl *e, struct image *image)
 	IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
 	free(flipped);
 	image->seed = IOSurfaceGetSeed(surface);
+	image->looked = e->frames + 1;
 	e->uploads++;
 	e->upload_bytes += row * (size_t)image->height;
 }
@@ -1006,9 +1052,9 @@ show_texture(struct eagl *e, struct image *image)
  * While the drawing thread is held (thread_suspend) nothing here allocates or takes a lock: it may hold malloc's.
  */
 #define PROF_SLOTS      8192
-#define PROF_DUMP       4000
+#define PROF_DUMP       800
 #define PROF_SHOWN      30
-#define PROF_DEPTH      9                       /* the program counter, the link register, seven callers from the frame chain */
+#define PROF_DEPTH      2                       /* PC + LR to aggregate hotspots without fragmenting callers */
 static unsigned prof_us;                        /* 0: no profile */
 static thread_t prof_thread;                    /* the drawing thread, the first that begins a frame */
 static struct {
@@ -1146,10 +1192,11 @@ frame_begin(struct eagl *e)
 	if (eagl_tracing) {
 		eagl_trace("---- frame %u (framebuffer %u)\n", e->frames + 1, e->framebuffer);
 	}
-	for (unsigned i = 0; i < e->image_count; i++) {
-		struct image *image = &e->images[i];
+	for (unsigned unit = 0; unit < 8; unit++) {
+		struct image *image;
 
-		if (image->target || image->shared || IOSurfaceGetSeed(image->surface) == image->seed) {
+		if (e->bound[unit] == 0 || (image = image_of(e, e->bound[unit])) == NULL ||
+		    image->target || image->shared || IOSurfaceGetSeed(image->surface) == image->seed) {
 			continue;
 		}
 		if (!rebound) {
@@ -1354,6 +1401,7 @@ my_glBindTexture(void *context, GLenum target, GLuint texture)
 		e->bound[e->unit] = texture;
 	}
 	if (texture != 0 && e->image_count != 0 && (image = image_of(e, texture)) != NULL && !image->shared &&
+	    image->looked != e->frames + 1 &&
 	    (!image->target ? IOSurfaceGetSeed(image->surface) != image->seed || surface_changed(e, image) :
 	    image->wrapped && !image->painted && surface_changed(e, image))) {
 		surface_to_texture(e, image);
@@ -3980,6 +4028,7 @@ my_initWithAPI(id self, SEL selector, unsigned long api, id properties)
 	}
 	if ((e->gl = hakios_gl_create((int)api)) == NULL || !hakios_gl_make_current(e->gl)) {
 		say("hakios-gl: %s gives no OpenGL ES %lu context\n", hakios_gl_library(), api);
+		free(e->images);
 		free(e);
 		return nil;
 	}
@@ -4179,6 +4228,7 @@ my_dealloc(id self, SEL selector)
 			current = NULL;
 		}
 		hakios_gl_destroy(e->gl);
+		free(e->images);
 		free(e);
 	}
 	((void (*)(struct objc_super *, SEL))objc_msgSendSuper)(&super, selector);

@@ -32,6 +32,8 @@
  *     answered, with that program's layers.
  */
 #include <CoreFoundation/CoreFoundation.h>
+#include <CoreGraphics/CoreGraphics.h>
+#include <IOSurface/IOSurfaceRef.h>
 #include <time.h>
 #include <IOKit/IOKitLib.h>
 #include <dispatch/dispatch.h>
@@ -1226,6 +1228,314 @@ control_center_fades(const char *arguments)
 }
 
 /*
+ * Boot-arg wallpaper_freeze=1: the wallpaper as one still picture (ported from upstream 348613f / 87bf485).
+ * Reads the IOSurface on the panel (kern.hakios.fb_surface) once unlocked on the home screen, saves it to
+ * /var/mobile/Library/hakios-wallpaper.raw for scaled screen classes (like XR 828x1792), and hides poster
+ * sublayers under one opaque UIImageView. wallpaper_freeze=2 hides the wallpaper without capturing it.
+ */
+typedef struct { double x, y, width, height; } hk_rect;
+
+static bool wallpaper_hide_only;
+static const void *wallpaper_frozen_key = &wallpaper_frozen_key;
+
+static id
+wallpaper_window(void)
+{
+	id app = SEND(id, objc_getClass("UIApplication"), "sharedApplication");
+	id windows = app != NULL ? SEND(id, app, "windows") : NULL;
+	unsigned long count = windows != NULL ? SEND(unsigned long, windows, "count") : 0;
+
+	for (unsigned long i = 0; i < count; i++) {
+		id window = ((id (*)(id, SEL, unsigned long))objc_msgSend)(windows, sel_registerName("objectAtIndex:"), i);
+		const char *name = object_getClassName(window);
+
+		if (strcasestr(name, "wallpaper") != NULL || strcasestr(name, "poster") != NULL) {
+			return window;
+		}
+	}
+	return NULL;
+}
+
+#define WALLPAPER_KEPT "/var/mobile/Library/hakios-wallpaper.raw"
+struct wallpaper_kept { uint32_t magic, width, height, row; };
+#define WALLPAPER_MAGIC 0x57504b31
+
+static void
+wallpaper_keep(const uint8_t *pixels, size_t width, size_t height, size_t row)
+{
+	struct wallpaper_kept head = { WALLPAPER_MAGIC, (uint32_t)width, (uint32_t)height, (uint32_t)row };
+	int fd = open(WALLPAPER_KEPT ".new", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+
+	if (fd < 0) {
+		say("hakios: SpringBoard: wallpaper_freeze: %s cannot be written\n", WALLPAPER_KEPT);
+		return;
+	}
+	bool whole = write(fd, &head, sizeof(head)) == (ssize_t)sizeof(head) &&
+	    write(fd, pixels, row * height) == (ssize_t)(row * height);
+	close(fd);
+	if (whole) {
+		rename(WALLPAPER_KEPT ".new", WALLPAPER_KEPT);
+		say("hakios: SpringBoard: wallpaper_freeze: the picture kept, %zux%zu\n", width, height);
+	}
+}
+
+static id
+wallpaper_kept_picture(double width_points, double height_points, double scale)
+{
+	struct wallpaper_kept head;
+	int fd = open(WALLPAPER_KEPT, O_RDONLY);
+	id image = NULL;
+
+	if (fd < 0) {
+		return NULL;
+	}
+	if (read(fd, &head, sizeof(head)) == (ssize_t)sizeof(head) && head.magic == WALLPAPER_MAGIC && head.width != 0 && head.height != 0 &&
+	    head.row >= head.width * 4 && head.height < 16384) {
+		size_t bytes = (size_t)head.row * head.height;
+		uint8_t *pixels = malloc(bytes);
+
+		if (pixels != NULL && read(fd, pixels, bytes) == (ssize_t)bytes) {
+			size_t w = (size_t)(width_points * scale + 0.5), h = (size_t)(height_points * scale + 0.5);
+			CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+			CGBitmapInfo info = kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst;
+			CFDataRef data = CFDataCreateWithBytesNoCopy(NULL, pixels, bytes, kCFAllocatorNull);
+			CGDataProviderRef provider = CGDataProviderCreateWithCFData(data);
+			CGImageRef kept = CGImageCreate(head.width, head.height, 8, 32, head.row, space, info, provider, NULL, false, kCGRenderingIntentDefault);
+			CGContextRef context = CGBitmapContextCreate(NULL, w, h, 8, 0, space, info);
+
+			if (kept != NULL && context != NULL) {
+				CGContextSetInterpolationQuality(context, kCGInterpolationHigh);
+				CGContextDrawImage(context, CGRectMake(0, 0, (CGFloat)w, (CGFloat)h), kept);
+				CGImageRef made = CGBitmapContextCreateImage(context);
+
+				if (made != NULL) {
+					image = ((id (*)(id, SEL, CGImageRef, double, long))objc_msgSend)((id)objc_getClass("UIImage"),
+					    sel_registerName("imageWithCGImage:scale:orientation:"), made, scale, 0L);
+					CGImageRelease(made);
+				}
+			}
+			say("hakios: SpringBoard: wallpaper_freeze: the picture kept (%ux%u) drawn at %zux%zu: %s\n", head.width, head.height, w, h,
+			    image != NULL ? "yes" : "NO");
+			if (context != NULL) CGContextRelease(context);
+			if (kept != NULL) CGImageRelease(kept);
+			CGDataProviderRelease(provider);
+			CFRelease(data);
+			CGColorSpaceRelease(space);
+		}
+		free(pixels);
+	}
+	close(fd);
+	return image;
+}
+
+static id
+wallpaper_picture(double scale)
+{
+	uint32_t sid = 0;
+	size_t size = sizeof(sid);
+	IOSurfaceRef surface;
+	id image = NULL;
+
+	if (sysctlbyname("kern.hakios.fb_surface", &sid, &size, NULL, 0) != 0 || sid == 0 ||
+	    (surface = IOSurfaceLookup(sid)) == NULL) {
+		say("hakios: SpringBoard: wallpaper_freeze=1: no surface on the panel to read (%u)\n", sid);
+		return NULL;
+	}
+	size_t width = IOSurfaceGetWidth(surface), height = IOSurfaceGetHeight(surface), row = IOSurfaceGetBytesPerRow(surface);
+
+	IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL);
+	CFDataRef pixels = CFDataCreate(NULL, IOSurfaceGetBaseAddress(surface), (CFIndex)(row * height));
+	IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+	unsigned distinct = 0;
+	if (pixels != NULL) {
+		const uint8_t *at = CFDataGetBytePtr(pixels);
+		uint32_t first = *(const uint32_t *)at;
+
+		for (unsigned k = 0; k < 97; k++) {
+			distinct += *(const uint32_t *)(at + (height * k / 97) * row + (width * k / 97) * 4) != first;
+		}
+	}
+	say("hakios: SpringBoard: wallpaper_freeze=1: surface %u, %zux%zu, %zu bytes a row, format %#x: %u of 97 samples unlike the first (%#x)\n",
+	    sid, width, height, row, IOSurfaceGetPixelFormat(surface), distinct, pixels != NULL ? *(const uint32_t *)CFDataGetBytePtr(pixels) : 0);
+	if (pixels != NULL && distinct >= 10) {
+		wallpaper_keep(CFDataGetBytePtr(pixels), width, height, row);
+		CGDataProviderRef provider = CGDataProviderCreateWithCFData(pixels);
+		CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+		CGImageRef cg = CGImageCreate(width, height, 8, 32, row, space, kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst,
+		    provider, NULL, false, kCGRenderingIntentDefault);
+
+		if (cg != NULL) {
+			image = ((id (*)(id, SEL, CGImageRef, double, long))objc_msgSend)((id)objc_getClass("UIImage"),
+			    sel_registerName("imageWithCGImage:scale:orientation:"), cg, scale, 0L);
+			CGImageRelease(cg);
+		}
+		CGColorSpaceRelease(space);
+		CGDataProviderRelease(provider);
+	}
+	if (pixels != NULL) {
+		CFRelease(pixels);
+	}
+	CFRelease(surface);
+	return image;
+}
+
+static void
+wallpaper_put(id window, id image)
+{
+	id layer = SEND(id, window, "layer");
+	id sublayers = SEND(id, SEND(id, layer, "sublayers"), "copy");
+	unsigned long count = sublayers != NULL ? SEND(unsigned long, sublayers, "count") : 0;
+	hk_rect bounds = ((hk_rect (*)(id, SEL))objc_msgSend)(window, sel_registerName("bounds"));
+
+	if (image != NULL) {
+		id view = ((id (*)(id, SEL, id))objc_msgSend)(SEND(id, objc_getClass("UIImageView"), "alloc"),
+		    sel_registerName("initWithImage:"), image);
+
+		((void (*)(id, SEL, hk_rect))objc_msgSend)(view, sel_registerName("setFrame:"), bounds);
+		((void (*)(id, SEL, BOOL))objc_msgSend)(view, sel_registerName("setOpaque:"), YES);
+		((void (*)(id, SEL, id))objc_msgSend)(window, sel_registerName("addSubview:"), view);
+		objc_setAssociatedObject(window, wallpaper_frozen_key, view, OBJC_ASSOCIATION_RETAIN);
+	} else {
+		objc_setAssociatedObject(window, wallpaper_frozen_key, window, OBJC_ASSOCIATION_ASSIGN);
+	}
+	for (unsigned long k = 0; k < count; k++) {
+		id sub = ((id (*)(id, SEL, unsigned long))objc_msgSend)(sublayers, sel_registerName("objectAtIndex:"), k);
+
+		((void (*)(id, SEL, BOOL))objc_msgSend)(sub, sel_registerName("setHidden:"), YES);
+	}
+	say("hakios: SpringBoard: wallpaper_freeze: %s %s (%lu layers hidden)\n", object_getClassName(window),
+	    image != NULL ? "is one picture now" : "hidden", count);
+}
+
+static bool
+wallpaper_home_showing(void)
+{
+	Class manager = objc_getClass("SBLockScreenManager");
+	id shared = manager != NULL ? SEND(id, manager, "sharedInstance") : NULL;
+	id app = SEND(id, objc_getClass("UIApplication"), "sharedApplication");
+
+	if (shared == NULL || SEND(BOOL, shared, "isUILocked")) {
+		return false;
+	}
+	if (app == NULL || !class_respondsToSelector(object_getClass(app), sel_registerName("_accessibilityFrontMostApplication"))) {
+		return app != NULL;
+	}
+	return SEND(id, app, "_accessibilityFrontMostApplication") == NULL;
+}
+
+static void
+wallpaper_freeze_pass(unsigned attempt)
+{
+	id window = wallpaper_window();
+	id screen = SEND(id, objc_getClass("UIScreen"), "mainScreen");
+	double scale = screen != NULL ? ((double (*)(id, SEL))objc_msgSend)(screen, sel_registerName("scale")) : 3.0;
+
+	if (window != NULL && objc_getAssociatedObject(window, wallpaper_frozen_key) != NULL) {
+		return;
+	}
+	if (window != NULL && !wallpaper_hide_only) {
+		hk_rect bounds = ((hk_rect (*)(id, SEL))objc_msgSend)(window, sel_registerName("bounds"));
+
+		if (bounds.width != 375 || bounds.height != 812 || scale != 3.0) {
+			id image = wallpaper_kept_picture(bounds.width, bounds.height, scale);
+
+			if (image != NULL) {
+				wallpaper_put(window, image);
+				return;
+			}
+			say("hakios: SpringBoard: wallpaper_freeze: no picture kept for this screen (%gx%g at %g): a boot at the iPhone X's screen first\n",
+			    bounds.width, bounds.height, scale);
+			return;
+		}
+	}
+	if (window == NULL || !wallpaper_home_showing()) {
+		if (attempt < 720) {
+			dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+				wallpaper_freeze_pass(attempt + 1);
+			});
+		}
+		return;
+	}
+	if (wallpaper_hide_only) {
+		wallpaper_put(window, NULL);
+		return;
+	}
+	{
+		hk_rect bounds = ((hk_rect (*)(id, SEL))objc_msgSend)(window, sel_registerName("bounds"));
+
+		if (bounds.width != 375 || bounds.height != 812 || scale != 3.0) {
+			id image = wallpaper_kept_picture(bounds.width, bounds.height, scale);
+
+			if (image != NULL) {
+				wallpaper_put(window, image);
+			} else {
+				say("hakios: SpringBoard: wallpaper_freeze: no picture kept for this screen: a boot at the iPhone X's first\n");
+			}
+			return;
+		}
+	}
+	id app = SEND(id, objc_getClass("UIApplication"), "sharedApplication");
+	id windows = SEND(id, app, "windows");
+	unsigned long count = SEND(unsigned long, windows, "count");
+	CFMutableArrayRef hidden = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
+
+	for (unsigned long i = 0; i < count; i++) {
+		id other = ((id (*)(id, SEL, unsigned long))objc_msgSend)(windows, sel_registerName("objectAtIndex:"), i);
+
+		if (strcmp(object_getClassName(other), "SBHomeScreenWindow") == 0 && !SEND(BOOL, other, "isHidden")) {
+			((void (*)(id, SEL, BOOL))objc_msgSend)(other, sel_registerName("setHidden:"), YES);
+			CFArrayAppendValue(hidden, other);
+		}
+	}
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 300 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+		id image = wallpaper_picture(scale);
+
+		for (CFIndex i = 0; i < CFArrayGetCount(hidden); i++) {
+			((void (*)(id, SEL, BOOL))objc_msgSend)((id)CFArrayGetValueAtIndex(hidden, i), sel_registerName("setHidden:"), NO);
+		}
+		CFRelease(hidden);
+		if (image != NULL) {
+			wallpaper_put(window, image);
+		} else if (attempt < 720) {
+			dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+				wallpaper_freeze_pass(attempt + 1);
+			});
+		}
+	});
+}
+
+static void
+wallpaper_freeze_say(unsigned times)
+{
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 60 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+		id window = wallpaper_window();
+
+		say("hakios: SpringBoard: wallpaper_freeze: the wallpaper's window %s is %s\n", window != NULL ? object_getClassName(window) : "(none)",
+		    window != NULL && objc_getAssociatedObject(window, wallpaper_frozen_key) != NULL ? "one picture" : "not frozen");
+		if (times > 1) {
+			wallpaper_freeze_say(times - 1);
+		}
+	});
+}
+
+static void
+wallpaper_freeze(const char *arguments)
+{
+	const char *argument;
+
+	if (arguments == NULL ||
+	    (argument = strstr(arguments, "wallpaper_freeze=")) == NULL || (argument != arguments && argument[-1] != ' ') ||
+	    (argument[17] != '1' && argument[17] != '2')) {
+		return;
+	}
+	wallpaper_hide_only = argument[17] == '2';
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+		wallpaper_freeze_pass(0);
+	});
+	wallpaper_freeze_say(15);
+}
+
+/*
  * Open the tweak loader of the package manager's prefix, when there is one. Nothing here depends on
  * it: without a prefix (or without ElleKit in it) the file is not there and this does nothing.
  */
@@ -1391,6 +1701,7 @@ hakios_springboard_init(void)
 
 			if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
 				control_center_fades(arguments);
+				wallpaper_freeze(arguments);
 			}
 		}
 		say("hakios: battery: SOC=%d%% battery=%d charger=%d charging=%d\n",
