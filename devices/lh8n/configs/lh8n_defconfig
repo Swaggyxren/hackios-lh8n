@@ -2,3 +2,4 @@
 #include common_defconfig
 #include mt6833.config
 CONFIG_DEVICE="lh8n"
+CONFIG_HAKIOS_BATTERY=y

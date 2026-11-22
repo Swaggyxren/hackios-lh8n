@@ -1327,8 +1327,9 @@ run_command(char *line)
 				close(null);
 			}
 		}
-		if (flash_root_mode && strcmp(argv[1], "/sbin/launchd.darwin") == 0) {
-			argv[1] = "/sbin/launchd";      /* the root is Darwin's own volume: its launchd is that */
+		if (flash_root_mode && strcmp(argv[1], "/sbin/launchd.darwin") == 0 &&
+		    stat("/sbin/launchd.darwin", &st) != 0) {
+			argv[1] = "/sbin/launchd";      /* raw Darwin volume: its launchd is that */
 		}
 		execve(argv[1], argv + 1, envp);
 		printf("%s: %s\n", argv[1], strerror(errno));

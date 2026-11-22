@@ -17,14 +17,14 @@
 	     Percentage, which an iPhone X has off at first) -->
 	<key>SBShowBatteryPercentage</key>
 	<true/>
-	<!-- 60 FPS UI optimizations: bypass expensive real-time blur shaders & parallax transforms -->
+	<!-- Enable standard iOS frosted glass blur, icon shadows, and vibrancy on hardware Mali-G57 GPU -->
 	<key>SBReduceTransparency</key>
-	<true/>
+	<false/>
 	<key>SBReduceMotion</key>
 	<false/>
 	<key>SBDisableIconShadows</key>
-	<true/>
+	<false/>
 	<key>BSUIVibrancyEffectViewDisabled</key>
-	<true/>
+	<false/>
 </dict>
 </plist>

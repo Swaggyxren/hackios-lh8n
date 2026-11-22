@@ -77,7 +77,7 @@ enum {
 #define MINISURF_TABLE_SIZE     16384
 #define MINISURF_MAX_DIMENSION  16384
 #define MINISURF_MAX_ALLOC      (512u << 20)
-#define MINISURF_ROW_ALIGN      64
+#define MINISURF_ROW_ALIGN      128
 /* boot-arg surf_align=1: rows a multiple of 64 bytes, as the Mali takes them (below); without it a row is as long as
  * the client asks for, as it was (the POCO's, unchanged) */
 static TUNABLE(uint32_t, gRowAlignAsked, "surf_align", 0);

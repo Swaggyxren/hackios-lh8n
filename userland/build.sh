@@ -155,8 +155,10 @@ fi
 
 # --- the small image ------------------------------------------------------------------------------
 rm -rf root
-mkdir -p root/sbin root/bin root/etc root/share root/LaunchDaemons
+mkdir -p root/sbin root/bin root/etc root/share root/LaunchDaemons root/flash root/tmp
 cp obj/init root/sbin/init
+cp obj/init root/sbin/launchd
+ln -s . root/redwood
 cp obj/child root/bin/child
 # The data volume into the flash and back (src/var_store.c), and the job that saves it when a run
 # ends: the program and its job together, away from the Darwin job list below, which several working

@@ -349,6 +349,8 @@ struct ColRun {
 	uint32_t        dstX, srcX, len;
 };
 
+class AppleARMBacklight;
+
 class IOMobileFramebuffer : public IOService
 {
 	OSDeclareDefaultStructors(IOMobileFramebuffer);
@@ -470,9 +472,30 @@ public:
 	unsigned        fHelpersBusy, fHelpersStarted;
 	uint32_t *      fHelperBlend[7];
 	void record(MiniIOSurface * s);
+	/* 0191-style CoreBrightness + MT6833 disp_pwm0 (0x1100e000) */
+	volatile uint32_t * fDisp;
+	volatile uint32_t * fPwm;
+	uint32_t        fPwmPeriod;
+	uint32_t        fBlLevel;
+	uint32_t        fMaxNits;
+	uint32_t        fBlChanges;
+	AppleARMBacklight * fBacklight;
+	void backlightStart(void);
+	void setBacklightLevel(uint32_t level);
+	virtual IOReturn setProperties(OSObject * properties) APPLE_KEXT_OVERRIDE;
+};
+
+class AppleARMBacklight : public IOService
+{
+	OSDeclareDefaultStructors(AppleARMBacklight);
+public:
+	IOMobileFramebuffer * fFB;
+	virtual IOReturn setProperties(OSObject * properties) APPLE_KEXT_OVERRIDE;
+	void publishLevel(uint32_t level);
 };
 
 OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
+OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
 
 static void
 setNumber(OSDictionary * dict, const char * key, uint64_t value)
@@ -608,6 +631,7 @@ extern "C" void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
 static TUNABLE(uint32_t, gFlipOn, "fb_flip", 0);
 static TUNABLE(uint32_t, gZeroCopy, "fb_zerocopy", 0);
 static TUNABLE(uint32_t, gZeroCopyVsync, "fb_zc_vsync", 1);
+static TUNABLE(uint32_t, gZeroCopyFlush, "fb_zc_flush", 0);
 
 void
 IOMobileFramebuffer::flipStart(void)
@@ -621,6 +645,7 @@ IOMobileFramebuffer::flipStart(void)
 	}
 #if defined(HAKIOS_MT6833_UFS) || defined(HAKIOS_MT6833_KEYS) || defined(HAKIOS_MT6833_MALI)
 	volatile uint32_t * disp = (volatile uint32_t *) ml_io_map(0x14000000ULL, 0x8000);
+	fDisp = disp;
 	fOvl = disp != NULL ? disp + (0x6000 / 4) : NULL;
 	fRdma = disp != NULL ? disp + (0x7000 / 4) : NULL;
 	if (disp != NULL) {
@@ -795,11 +820,13 @@ IOMobileFramebuffer::tryDirectScanout(const uint8_t * swap, MiniIOSurface ** sur
 	if (hold != prev) {
 		MiniIOSurfaceUse(hold, 1);
 	}
-	FlushPoC_DcacheRegion((vm_offset_t) (s->kpixels + s->info.offset), (size_t) s->info.bytesPerRow * s->info.height);
+	if (gZeroCopyFlush || fScanCount < 2) {
+		FlushPoC_DcacheRegion((vm_offset_t) (s->kpixels + s->info.offset), (size_t) s->info.bytesPerRow * s->info.height);
+	}
 	__builtin_arm_dsb(0xf);
 	if (!fOvlDirect || fLastScanW != srcW || fLastScanH != s->info.height ||
 	    fLastScanPitch != s->info.bytesPerRow || fLastScanOff != offReg) {
-		fOvl[FLIP_OVL_L0_CON / 4] = fOvlConSaved & ~0x100u;
+		fOvl[FLIP_OVL_L0_CON / 4] = fOvlConSaved;
 		fOvl[FLIP_OVL_L0_SIZE / 4] = ((uint32_t) s->info.height << 16) | srcW;
 		fOvl[FLIP_OVL_L0_OFF / 4] = offReg;
 		fOvl[FLIP_OVL_L0_PITCH / 4] = s->info.bytesPerRow;
@@ -973,6 +1000,7 @@ IOMobileFramebuffer::start(IOService * provider)
 	publishModes();
 	setName("disp0");
 	registerService();
+	backlightStart();
 	return true;
 }
 
@@ -988,6 +1016,162 @@ surfaceHolds(const MiniIOSurface * s, uint64_t rows, uint64_t columns)
 		return true;
 	}
 	return (uint64_t) s->info.offset + (rows - 1) * s->info.bytesPerRow + columns * 4 <= s->info.allocSize;
+}
+
+#define DISP_PWM0_PA            0x1100e000ULL
+#define DISP_PWM_EN             0x00u
+#define DISP_PWM_COMMIT         0x0Cu
+#define DISP_PWM_CON_0          0x18u
+#define DISP_PWM_CON_1          0x1Cu
+#define kFBBacklightMax         4095u
+
+void
+IOMobileFramebuffer::backlightStart(void)
+{
+	uint32_t initLevel = 1043u;
+
+	fMaxNits = 500u;
+	PE_parse_boot_argn("fb_max_nits", &fMaxNits, sizeof(fMaxNits));
+	if (fMaxNits < 50u) {
+		fMaxNits = 50u;
+	}
+#if defined(HAKIOS_MT6833_UFS) || defined(HAKIOS_MT6833_KEYS) || defined(HAKIOS_MT6833_MALI)
+	fPwm = (volatile uint32_t *) ml_io_map(DISP_PWM0_PA, PAGE_SIZE);
+	if (fPwm != NULL) {
+		uint32_t en = fPwm[DISP_PWM_EN / 4];
+		uint32_t con0 = fPwm[DISP_PWM_CON_0 / 4];
+		uint32_t con1 = fPwm[DISP_PWM_CON_1 / 4];
+		uint32_t period = con1 & 0xfffu;
+		uint32_t hw = (con1 >> 16) & 0x1fffu;
+
+		fPwmPeriod = period != 0 ? period : 0x3ffu;
+		if (period != 0 && hw <= fPwmPeriod) {
+			initLevel = (hw * kFBBacklightMax + (fPwmPeriod / 2u)) / fPwmPeriod;
+		}
+		IOLog("MiniIOMobileFramebuffer: disp_pwm0 @ %#llx (EN=%#x CON_0=%#x CON_1=%#x period=%u hw=%u -> level=%u)\n",
+		    DISP_PWM0_PA, en, con0, con1, fPwmPeriod, hw, initLevel);
+	}
+#else
+	fPwm = NULL;
+	fPwmPeriod = 0x3ffu;
+#endif
+	fBlLevel = initLevel;
+	setProperty("IOMFBBrightnessLevel", (unsigned long long) ((uint64_t) ((initLevel * fMaxNits) / kFBBacklightMax) << 16), 32);
+
+	AppleARMBacklight * b = OSTypeAlloc(AppleARMBacklight);
+	if (b == NULL || !b->init()) {
+		OSSafeReleaseNULL(b);
+		return;
+	}
+	b->fFB = this;
+	b->setProperty("backlight-control", kOSBooleanTrue);
+	b->publishLevel(initLevel);
+	if (!b->attach(this)) {
+		b->release();
+		return;
+	}
+	b->registerService();
+	fBacklight = b;
+}
+
+void
+IOMobileFramebuffer::setBacklightLevel(uint32_t level)
+{
+	if (level > kFBBacklightMax) {
+		level = kFBBacklightMax;
+	}
+	if (fPwm != NULL && fPwmPeriod != 0) {
+		uint32_t hw = (level * fPwmPeriod + (kFBBacklightMax / 2u)) / kFBBacklightMax;
+		if (level != 0 && hw == 0) {
+			hw = 1u;
+		}
+		uint32_t con1 = fPwm[DISP_PWM_CON_1 / 4];
+		fPwm[DISP_PWM_CON_1 / 4] = (con1 & 0xe000f000u) | (fPwmPeriod & 0xfffu) | ((hw & 0x1fffu) << 16);
+		if (hw != 0 && (fPwm[DISP_PWM_EN / 4] & 1u) == 0) {
+			fPwm[DISP_PWM_EN / 4] |= 1u;
+		}
+		__asm__ volatile ("dsb sy" ::: "memory");
+		fPwm[DISP_PWM_COMMIT / 4] = 1u;
+		if (fBlChanges < 16) {
+			IOLog("MiniIOMobileFramebuffer: backlight level=%u/%u -> hw=%u/%u\n",
+			    level, kFBBacklightMax, hw, fPwmPeriod);
+		}
+	}
+	fBlChanges++;
+	fBlLevel = level;
+	if (fBacklight != NULL) {
+		fBacklight->publishLevel(level);
+	}
+}
+
+void
+AppleARMBacklight::publishLevel(uint32_t level)
+{
+	OSDictionary * params = OSDictionary::withCapacity(1);
+	OSDictionary * bright = OSDictionary::withCapacity(3);
+
+	if (params != NULL && bright != NULL) {
+		setNumber(bright, "min", 0);
+		setNumber(bright, "max", kFBBacklightMax);
+		setNumber(bright, "value", level);
+		params->setObject("brightness", bright);
+		setProperty("IODisplayParameters", params);
+	}
+	OSSafeReleaseNULL(bright);
+	OSSafeReleaseNULL(params);
+}
+
+static bool
+fb_extract_brightness(OSObject * o, uint64_t * out)
+{
+	OSNumber * n = OSDynamicCast(OSNumber, o);
+	OSDictionary * d = OSDynamicCast(OSDictionary, o);
+
+	if (n == NULL && d != NULL) {
+		n = OSDynamicCast(OSNumber, d->getObject("value"));
+	}
+	if (n == NULL) {
+		return false;
+	}
+	*out = n->unsigned64BitValue();
+	return true;
+}
+
+IOReturn
+AppleARMBacklight::setProperties(OSObject * properties)
+{
+	OSDictionary * dict = OSDynamicCast(OSDictionary, properties);
+	OSDictionary * params;
+	uint64_t v = 0;
+
+	if (dict == NULL || fFB == NULL) {
+		return kIOReturnBadArgument;
+	}
+	params = OSDynamicCast(OSDictionary, dict->getObject("IODisplayParameters"));
+	if (fb_extract_brightness(dict->getObject("brightness"), &v) ||
+	    (params != NULL && fb_extract_brightness(params->getObject("brightness"), &v))) {
+		fFB->setBacklightLevel((uint32_t) (v > kFBBacklightMax ? kFBBacklightMax : v));
+	}
+	return kIOReturnSuccess;
+}
+
+IOReturn
+IOMobileFramebuffer::setProperties(OSObject * properties)
+{
+	OSDictionary * dict = OSDynamicCast(OSDictionary, properties);
+	OSNumber * n = dict != NULL ? OSDynamicCast(OSNumber, dict->getObject("IOMFBBrightnessLevel")) : NULL;
+
+	if (n == NULL) {
+		return kIOReturnUnsupported;
+	}
+	uint64_t nits16 = n->unsigned32BitValue();
+	uint64_t level = (nits16 * kFBBacklightMax + ((uint64_t) fMaxNits << 15)) / ((uint64_t) fMaxNits << 16);
+	if (nits16 != 0 && level == 0) {
+		level = 1;
+	}
+	setBacklightLevel((uint32_t) (level > kFBBacklightMax ? kFBBacklightMax : level));
+	setProperty("IOMFBBrightnessLevel", n);
+	return kIOReturnSuccess;
 }
 
 /* Keep a small copy of the frame that is about to be shown (the surface is the whole screen). */

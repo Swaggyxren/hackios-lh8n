@@ -119,6 +119,26 @@ static const uint8_t core_order[8] = { 0, 7, 6, 1, 2, 3, 4, 5 };
 #ifndef XNU_SERIAL
 #define XNU_SERIAL          "HAKIOS0000000000"
 #endif
+static char runtime_serial[32];
+static int battery_published;
+
+#define BATTERY_PAGE_PA                0x80240000ULL
+#define LOADER_BATTERY_MAGIC           0x2154544142574452ULL /* "RDWBATT!" */
+#define LOADER_BATTERY_VERSION         1
+#define LOADER_BATTERY_VALID           (1u << 0)
+#define LOADER_BATTERY_PRESENT         (1u << 1)
+#define LOADER_BATTERY_CHARGER_PRESENT (1u << 2)
+#define LOADER_BATTERY_VOLTAGE_VALID   (1u << 3)
+#define LOADER_BATTERY_CHARGING        (1u << 4)
+
+struct loader_battery {
+	uint64_t magic;
+	uint32_t version, size;
+	volatile uint32_t sequence;
+	uint32_t flags;
+	int32_t soc_percent, voltage_mv, current_ma, temperature_c;
+	uint32_t charger_action, polls, failures, reserved;
+};
 #ifndef XNU_EXTRA_ARGS
 #define XNU_EXTRA_ARGS      "cpus=1 systrace=1 applog=1 touchscreen=1 sound=0"
 #endif
@@ -1203,8 +1223,22 @@ static uint32_t build_device_tree(uint64_t dt_pa, uint64_t rd_pa, uint64_t rd_si
 	dt_begin(&w, "device-tree");
 	dt_identity(&w, identity_root, sizeof(identity_root) / sizeof(identity_root[0]), identity_root_data);
 	dt_prop_str(&w, "platform-name", "t8015");
-	dt_prop_padded(&w, "serial-number", XNU_SERIAL, 32);
-	dt_prop_padded(&w, "mlb-serial-number", XNU_SERIAL "MLB", 32);
+	{
+		const char *sn = runtime_serial[0] ? runtime_serial : XNU_SERIAL;
+		char mlb[36];
+		uint32_t snlen = 0;
+
+		while (sn[snlen] != 0 && snlen < 28) {
+			mlb[snlen] = sn[snlen];
+			snlen++;
+		}
+		mlb[snlen] = 'M';
+		mlb[snlen + 1] = 'L';
+		mlb[snlen + 2] = 'B';
+		mlb[snlen + 3] = 0;
+		dt_prop_padded(&w, "serial-number", sn, 32);
+		dt_prop_padded(&w, "mlb-serial-number", mlb, 32);
+	}
 	dt_prop_padded(&w, "model-number", "MQAC2", 32);
 	dt_prop_padded(&w, "region-info", "LL/A", 32);
 	dt_prop_padded(&w, "regulatory-model-number", "A1865", 32);
@@ -2952,13 +2986,27 @@ static void __attribute__((noreturn)) run_xnu(void)
 		}
 	}
 
+	if (battery_published) {
+		static const char barg[] = " battery=1 battery_shared_pa=0x80240000";
+		uint32_t n = 0;
+
+		while (n < BOOT_LINE_LENGTH && ba->commandLine[n] != 0) {
+			n++;
+		}
+		if (n + sizeof(barg) <= BOOT_LINE_LENGTH) {
+			memcpy(ba->commandLine + n, barg, sizeof(barg));
+		}
+	}
+
 	out("md0 ");
 	out_hex(sys_size ? sys_pa : rd_pa);
 	out(sys_size ? " (the system image), md1 " : " (root.apfs only)");
 	if (sys_size) {
 		out_hex(rd_pa);
 	}
-	out("\nboot-args: " XNU_BOOT_ARGS "\nframebuffer ");
+	out("\nboot-args: ");
+	out(ba->commandLine);
+	out("\nframebuffer ");
 	out_hex(fb_base);
 	out(" pitch ");
 	out_dec(fb_pitch);
@@ -3644,6 +3692,205 @@ static int pmsg_take(const char *flag, uint32_t n)
 	return found;
 }
 
+static int parse_i32_token(const volatile char *d, uint32_t cap, uint32_t *pos, int32_t *out_v)
+{
+	int neg = 0, any = 0;
+	int64_t val = 0;
+	uint32_t p = *pos;
+
+	if (p < cap && d[p] == '-') {
+		neg = 1;
+		p++;
+	}
+	while (p < cap && d[p] >= '0' && d[p] <= '9') {
+		val = val * 10 + (d[p] - '0');
+		any = 1;
+		p++;
+	}
+	if (!any) {
+		return 0;
+	}
+	*out_v = (int32_t)(neg ? -val : val);
+	*pos = p;
+	return 1;
+}
+
+static void pmsg_parse_request(void)
+{
+	volatile char *d = (volatile char *)RAMOOPS_PMSG;
+	uint32_t cap = RAMOOPS_PMSG_SIZE;
+	static const char key_batt[] = ":batt=";
+	static const char key_ser[] = ":serial=";
+
+	for (uint32_t at = 0; at + sizeof(key_batt) <= cap; at++) {
+		uint32_t k = 0;
+		while (k < sizeof(key_batt) - 1 && d[at + k] == key_batt[k]) {
+			k++;
+		}
+		if (k == sizeof(key_batt) - 1) {
+			uint32_t p = at + k;
+			int32_t v[6] = { -1, -1, 0, -273, 0, 0 };
+			int ok = 1;
+
+			for (int i = 0; i < 6; i++) {
+				if (!parse_i32_token(d, cap, &p, &v[i])) {
+					ok = 0;
+					break;
+				}
+				if (i < 5) {
+					if (p >= cap || d[p] != ',') {
+						ok = 0;
+						break;
+					}
+					p++;
+				}
+			}
+			if (ok && v[0] >= 0 && v[0] <= 100) {
+				volatile struct loader_battery *b = (volatile struct loader_battery *)(uintptr_t)BATTERY_PAGE_PA;
+				uint32_t flags = LOADER_BATTERY_VALID | LOADER_BATTERY_PRESENT;
+
+				if (v[1] >= 0) {
+					flags |= LOADER_BATTERY_VOLTAGE_VALID;
+				}
+				if (v[5] != 0) {
+					flags |= LOADER_BATTERY_CHARGER_PRESENT;
+				}
+				if (v[4] == 1 && v[0] < 100) {
+					flags |= LOADER_BATTERY_CHARGING;
+				}
+				memset((void *)(uintptr_t)BATTERY_PAGE_PA, 0, sizeof(*b));
+				b->magic = LOADER_BATTERY_MAGIC;
+				b->version = LOADER_BATTERY_VERSION;
+				b->size = sizeof(struct loader_battery);
+				b->sequence = 2;
+				b->flags = flags;
+				b->soc_percent = v[0];
+				b->voltage_mv = v[1];
+				b->current_ma = v[2];
+				b->temperature_c = v[3];
+				b->charger_action = (uint32_t)v[4];
+				dcache_clean_range(BATTERY_PAGE_PA, sizeof(*b));
+				battery_published = 1;
+				out("battery: published at 0x80240000 SOC=");
+				out_dec((uint64_t)v[0]);
+				out("% V=");
+				out_dec((uint64_t)(v[1] >= 0 ? v[1] : 0));
+				out("mV\n");
+			}
+			for (uint32_t c = at; c < p && c < cap; c++) {
+				d[c] = '-';
+			}
+		}
+	}
+	for (uint32_t at = 0; at + sizeof(key_ser) <= cap; at++) {
+		uint32_t k = 0;
+		while (k < sizeof(key_ser) - 1 && d[at + k] == key_ser[k]) {
+			k++;
+		}
+		if (k == sizeof(key_ser) - 1) {
+			uint32_t p = at + k, n = 0;
+			while (p < cap && n < sizeof(runtime_serial) - 1 &&
+			       d[p] != ':' && d[p] != '\n' && d[p] != '\r' && d[p] != '\0' && d[p] != ' ') {
+				runtime_serial[n++] = (char)d[p++];
+			}
+			runtime_serial[n] = '\0';
+			for (uint32_t c = at; c < p && c < cap; c++) {
+				d[c] = '-';
+			}
+			out("serial: from request ");
+			out(runtime_serial);
+			out("\n");
+		}
+	}
+	if (!battery_published) {
+		volatile struct loader_battery *b = (volatile struct loader_battery *)(uintptr_t)BATTERY_PAGE_PA;
+		int32_t soc = 50, vbat_mv = 3900, cur_ma = 0;
+		uint16_t top = 0, raw = 0;
+		uint32_t flags = LOADER_BATTERY_VALID | LOADER_BATTERY_PRESENT;
+		int chr = 0, action = 0;
+
+		if (pwrap_read_ro(0x002a, &top)) {
+			chr = (top & (1u << 2)) != 0;   /* MT6359P TOPSTATUS bit 2 = CHRDET */
+		}
+		if (pwrap_write16(0x110e, 0x0001)) {            /* MT6359P AUXADC_RQST0 CH0 (VBAT) */
+			dbg_delay_us(30);
+			if (pwrap_read_ro(0x1088, &raw)) {      /* MT6359P AUXADC_ADC_OUT_CH0 (15-bit) */
+				uint32_t r15 = raw & 0x7fffu;
+				int32_t mv = (int32_t)((r15 * 6300u) >> 15);
+				if (mv >= 2500 && mv <= 4600) {
+					static const int16_t ocv_mv[] = {
+						3350, 3500, 3600, 3650, 3720, 3780, 3840, 3920, 4020, 4120, 4220, 4350
+					};
+					static const int8_t ocv_soc[] = {
+						0, 5, 15, 20, 30, 42, 55, 70, 82, 90, 96, 100
+					};
+					int32_t adj_mv = chr ? (mv - 25) : mv;
+					vbat_mv = mv;
+					flags |= LOADER_BATTERY_VOLTAGE_VALID;
+					if (adj_mv <= ocv_mv[0]) {
+						soc = 0;
+					} else if (adj_mv >= ocv_mv[11]) {
+						soc = 100;
+					} else {
+						for (int i = 0; i < 11; i++) {
+							if (adj_mv <= ocv_mv[i + 1]) {
+								int32_t span = ocv_mv[i + 1] - ocv_mv[i];
+								soc = ocv_soc[i] +
+								      ((adj_mv - ocv_mv[i]) * (ocv_soc[i + 1] - ocv_soc[i]) + span / 2) / span;
+								break;
+							}
+						}
+					}
+				}
+			}
+		}
+		flags |= (1u << 5); /* LOADER_BATTERY_SOC_ESTIMATED */
+		if (chr) {
+			flags |= LOADER_BATTERY_CHARGER_PRESENT;
+			if (soc < 100) {
+				flags |= LOADER_BATTERY_CHARGING;
+				cur_ma = 450;
+				action = 1;
+			} else {
+				action = 4;
+			}
+		} else {
+			cur_ma = -250;
+			action = 2;
+		}
+		memset((void *)(uintptr_t)BATTERY_PAGE_PA, 0, sizeof(*b));
+		b->magic = LOADER_BATTERY_MAGIC;
+		b->version = LOADER_BATTERY_VERSION;
+		b->size = sizeof(struct loader_battery);
+		b->sequence = 2;
+		b->flags = flags;
+		b->soc_percent = soc;
+		b->voltage_mv = vbat_mv;
+		b->current_ma = cur_ma;
+		b->temperature_c = 34;
+		b->charger_action = (uint32_t)action;
+		dcache_clean_range(BATTERY_PAGE_PA, sizeof(*b));
+		battery_published = 1;
+		out("battery: PMIC VBAT=");
+		out_dec((uint64_t)vbat_mv);
+		out("mV SOC=");
+		out_dec((uint64_t)soc);
+		out("% chr=");
+		out_dec((uint64_t)chr);
+		out(" (top=");
+		out_hex(top);
+		out(" raw=");
+		out_hex(raw);
+		out(")\n");
+	}
+	if (!runtime_serial[0]) {
+		static const char def_ser[] = "H333LH8NU0123456";
+		for (uint32_t i = 0; i < sizeof(def_ser); i++) {
+			runtime_serial[i] = def_ser[i];
+		}
+	}
+}
+
 static int xnu_requested(void)
 {
 	if (pmsg_take(boot_xnu_flag, sizeof(boot_xnu_flag) - 1))
@@ -4036,6 +4283,8 @@ void mtkloader_main(uint64_t dtb)
 	out_hex(dtb);
 	out("\n");
 	connsys_dt_report(dtb);         /* Wi-Fi step 1: what Android's tree says of CONNSYS (mtkconnsys.h) */
+	pmsg_parse_request();
+	(void)xnu_requested();
 	ufs_probe();
 	ufs_setup_shared();
 	run_xnu();
