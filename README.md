@@ -17,12 +17,14 @@ The kernel, its MediaTek drivers, the `mtkloader` bootloader, and the staging to
 | Feature | Status | Implementation |
 |---|---|---|
 | Boot chain | working | Android boot header v4; `mtkloader` chained in `boot_a`, XNU payload staged in `vendor_boot_a` |
-| Homescreen / shell | working | Graphical iOS 16.5 SpringBoard, wallpaper, dock and icons, resident (`loader_return_after=0`, graphics mode) |
-| Display | working | 1080 × 2460 @ 120 Hz (`fb_hz=120 fb_filter=0`, CoreAnimation 120 Hz pacing via LaunchDaemon env vars) |
+| Homescreen / shell | working | Graphical iOS 16.5 SpringBoard, frosted-glass dock/vibrancy/icon shadows, wallpaper, resident (`loader_return_after=0`, graphics mode) |
+| Display | working | 1080 × 2460 @ 120 Hz (`OVL0_2L` triple-buffered `fb_flip=1` and zero-copy `IOSurface` direct scanout `fb_zerocopy=1` with 128-byte row alignment, up to 119 FPS) |
+| Brightness / backlight | working | `AppleARMBacklight` driving MediaTek `disp_pwm0 @ 0x1100e000` (Control Center & Lock Screen brightness slider) |
 | CPU | working | All 8 cores — 2× Cortex-A76 @ 1993 MHz (stock OPP #4 via MT6833 v2 PWRAP) + 6× Cortex-A55 @ 2000 MHz |
 | Storage / root | working | Native UFS 2.2 handover; APFS root on `ufs_xnusys` mounted read-only |
 | Touch / input | working | FT8726 over SPI4; boot-ROM firmware download, then live `DOWN`/`UP` events reach SpringBoard |
-| Buttons | in progress | Power and volume keys via MT6833 GPIO/PMIC |
+| Buttons | working | Power key (`MT6359P` PMIC `TOPSTATUS 0x002a` via PWRAP v2 `SWINF_2`), Volume Up (`KP_MEM1` bit 0) & Volume Down (`GPIO 42` / `KP_MEM1`) |
+| Battery / charger | working | Live `MT6359P` AUXADC `VBAT` + `CHRDET` read in `mtkloader` (`0x80240000` shared block) -> `AppleARMPMUCharger` (`IOPMPowerSource`) |
 | GPU | working | Hardware Mali-G57 MC2 @ 1000 MHz (`MFGPLL`, `HakiosPanfrostGPU` + Mesa 25.0.7 Panfrost, WC BOs, fast job poll, 0 faults) |
 | Sensors | staged | Accelerometer via the SCP sensor hub |
 | Wi-Fi / BT | staged | CONNSYS initialization |
